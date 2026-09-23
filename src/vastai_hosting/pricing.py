@@ -5,6 +5,9 @@ from .config import Config
 
 Row = dict[str, Any]
 
+# Below this, the listed price and the public offer disagree (e.g. a price change mid-cycle).
+MIN_HOST_SHARE = 0.5
+
 
 def required_number(row: Row, field: str) -> float:
     value = row.get(field)
@@ -42,20 +45,48 @@ def host_details(own: Row) -> Row:
         "inetDownMbps": _optional_number(own, "inet_down"),
         "diskBwMbps": _optional_number(own, "disk_bw"),
         "geolocation": own.get("geolocation") if isinstance(own.get("geolocation"), str) else None,
-        "currentRentals": _optional_number(own, "current_rentals_on_demand"),
+        "runningOnDemandRentals": _optional_number(own, "current_rentals_running_on_demand"),
     }
 
 
-def peers_from_search(data: Any, own: Row, config: Config) -> list[Row]:
+def _offers(data: Any) -> list[Any]:
     offers = (
         data if isinstance(data, list) else data.get("offers") if isinstance(data, dict) else None
     )
     if not isinstance(offers, list):
         raise ValueError("expected offers array")
-    if len(offers) >= config.offer_limit:
-        raise ValueError(
-            "market results reached OFFER_LIMIT; increase it to avoid a truncated median"
-        )
+    return offers
+
+
+def host_share(own: Row, own_offers: Any) -> float:
+    """Host earnings per renter dollar, from the host's own public offer.
+
+    Offers show `dph_base` as the renter price; the host's `listed_gpu_cost` is what it earns.
+    """
+    listed = required_number(own, "listed_gpu_cost")
+    for item in _offers(own_offers):
+        if not isinstance(item, dict) or item.get("machine_id") != own.get("machine_id"):
+            continue
+        base = _optional_number(item, "dph_base")
+        count = item.get("num_gpus")
+        if not base or not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            continue
+        share = listed / (base / count)
+        if MIN_HOST_SHARE <= share <= 1:
+            return share
+    raise ValueError("no consistent public offer for the host; cannot convert peer prices")
+
+
+def peers_from_search(batches: list[Any], own: Row, config: Config, share: float) -> list[Row]:
+    """Comparable peers from repeated searches, priced in host earnings per GPU-hour."""
+    offers: list[Any] = []
+    for data in batches:
+        batch = _offers(data)
+        if len(batch) >= config.offer_limit:
+            raise ValueError(
+                "market results reached OFFER_LIMIT; increase it to avoid a truncated median"
+            )
+        offers.extend(batch)
 
     name = own.get("gpu_name")
     count = required_number(own, "num_gpus")
@@ -87,7 +118,7 @@ def peers_from_search(data: Any, own: Row, config: Config) -> list[Row]:
         seen.add(machine_id)
         peers.append(
             {
-                "gpuPrice": float(base) / count,
+                "gpuPrice": round(float(base) / count * share, 4),
                 "reliability": _optional_number(item, "reliability2"),
                 "gpuRamMb": _optional_number(item, "gpu_ram"),
                 "cpuRamMb": _optional_number(item, "cpu_ram"),

@@ -1,3 +1,6 @@
+import json
+from dataclasses import replace
+
 import pytest
 
 from vastai_hosting.config import Config
@@ -27,21 +30,55 @@ def config() -> Config:
         volume_size_gb=200,
         volume_price=0.15,
         duration_days=7,
+        running_cost=0.0,
     )
 
 
-def test_recommendation_is_locally_bounded_and_rounded() -> None:
+def answer(*estimates: tuple[float, float], rationale: str = "Comparable GPUs") -> str:
+    candidates = [{"price": price, "occupancy": share} for price, share in estimates]
+    return json.dumps({"candidates": candidates, "rationale": rationale})
+
+
+def test_recommendation_maximises_expected_profit() -> None:
     cfg = config()
-    assert parse_recommendation('{"target_price":0.496,"rationale":"Comparable GPUs"}', cfg) == (
-        0.5,
-        "Comparable GPUs",
-    )
-    for text in [
-        '{"target_price":10,"rationale":"raise it"}',
-        '{"target_price":"0.50","rationale":"fine"}',
-        '{"target_price":0.5,"rationale":""}',
-        '{"target_price":NaN,"rationale":"invalid"}',
+    text = answer((0.6, 0.5), (0.45, 0.9), (0.496, 0.8), rationale=" Cheapest  comparable ")
+    best = parse_recommendation(text, cfg, 0.5)
+    assert (best.price, best.occupancy, best.rationale) == (0.45, 0.9, "Cheapest comparable")
+    assert best.hourly_profit == pytest.approx(0.405)
+    assert best.estimates == ((0.45, 0.9), (0.5, 0.8), (0.6, 0.5))
+
+    costly = parse_recommendation(text, replace(cfg, running_cost=0.1), 0.5)
+    assert costly.price == 0.5
+    assert costly.hourly_profit == pytest.approx(0.32)
+
+
+def test_equal_profit_keeps_the_price_closest_to_current() -> None:
+    text = answer((0.4, 1.0), (0.5, 0.8), (0.8, 0.5))
+    assert parse_recommendation(text, config(), 0.5).price == 0.5
+    assert parse_recommendation(text, config(), 0.2).price == 0.4
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        answer((0.4, 0.9), (0.5, 0.95), (0.6, 0.5)),
+        answer((0.4, 0.9), (10, 0.1), (0.5, 0.5)),
+        answer((0.4, 1.5), (0.5, 0.8), (0.6, 0.5)),
+        answer((0.4, 0.9), (0.6, 0.5), (0.7, 0.4)),
+        answer((0.5, 0.8), (0.501, 0.8), (0.6, 0.5)),
+        answer((0.5, 0.8), (0.6, 0.5)),
+        answer((0.5, 0.8), (0.6, 0.5), (0.7, 0.3), rationale=""),
+        answer((0.5, 0.8), (0.6, 0.5), (0.7, 0.3)).replace("0.6", '"0.6"'),
+        answer((0.5, 0.8), (0.6, 0.5), (0.7, 0.3)).replace("0.6", "NaN"),
+        '{"target_price":0.5,"rationale":"old shape"}',
         "not JSON",
-    ]:
-        with pytest.raises(ValueError):
-            parse_recommendation(text, cfg)
+    ],
+)
+def test_invalid_recommendations_are_rejected(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_recommendation(text, config(), 0.5)
+
+
+def test_current_price_is_only_required_when_listable() -> None:
+    text = answer((0.4, 0.9), (0.6, 0.5), (0.7, 0.4))
+    assert parse_recommendation(text, config(), 0.2).price == 0.4

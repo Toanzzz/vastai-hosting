@@ -26,6 +26,7 @@ class Config:
     volume_size_gb: int
     volume_price: float
     duration_days: int
+    running_cost: float
 
 
 def _text(key: str) -> str:
@@ -44,6 +45,10 @@ def _number(key: str) -> float:
     if not isfinite(value) or value < 0:
         raise ValueError(f"{key} must be a finite nonnegative number")
     return value
+
+
+def _optional_number(key: str, default: float) -> float:
+    return _number(key) if os.environ.get(key, "").strip() else default
 
 
 def _integer(key: str) -> int:
@@ -80,6 +85,7 @@ def load_config() -> Config:
         volume_size_gb=_integer("VOLUME_SIZE_GB"),
         volume_price=_number("VOLUME_PRICE"),
         duration_days=_integer("DURATION_DAYS"),
+        running_cost=_optional_number("GPU_RUNNING_COST", 0.0),
     )
     if (
         config.machine_id == 0
@@ -96,6 +102,7 @@ def load_config() -> Config:
         or config.min_bid_price > config.min_price
         or config.volume_size_gb == 0
         or not 2 <= config.duration_days <= 365
+        or config.running_cost >= config.max_price
     ):
         raise ValueError("invalid pricing, interval, peer count, bid floor or listing settings")
     return config
