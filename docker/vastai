@@ -1,0 +1,4 @@
+#!/usr/bin/python3
+from vastai.cli.main import main
+
+main()
