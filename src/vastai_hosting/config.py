@@ -29,11 +29,39 @@ class Config:
     running_cost: float
 
 
+# Defaults for the one listed host (machine 51673, one RTX 5090).
+# An unset or blank variable uses the default; set it only to override.
+DEFAULTS: dict[str, str] = {
+    "GEMINI_MODEL": "gemini-flash-latest",
+    "GEMINI_THINKING_BUDGET": "1024",
+    "MACHINE_ID": "51673",
+    "DRY_RUN": "true",
+    "POLL_SECONDS": "86400",
+    "MIN_PEERS": "5",
+    "OFFER_LIMIT": "200",
+    "MIN_PRICE": "0.40",
+    "MAX_PRICE": "1.00",
+    "MIN_CHANGE": "0.01",
+    "GPU_RUNNING_COST": "0",
+    "DISK_PRICE": "0.15",
+    "UPLOAD_PRICE": "0.001953125",
+    "DOWNLOAD_PRICE": "0.001953125",
+    "MIN_BID_PRICE": "0.40",
+    "DISCOUNT_RATE": "0.10",
+    "MIN_CHUNK": "1",
+    "VOLUME_SIZE_GB": "209",
+    "VOLUME_PRICE": "0.15",
+    "DURATION_DAYS": "7",
+}
+
+
 def _text(key: str) -> str:
     value = os.environ.get(key, "").strip()
-    if not value:
-        raise ValueError(f"missing {key}")
-    return value
+    if value:
+        return value
+    if key in DEFAULTS:
+        return DEFAULTS[key]
+    raise ValueError(f"missing {key}")
 
 
 def _number(key: str) -> float:
@@ -59,7 +87,7 @@ def _integer(key: str) -> int:
 
 
 def load_config() -> Config:
-    dry_run = os.environ.get("DRY_RUN", "true")
+    dry_run = _text("DRY_RUN")
     if dry_run not in {"true", "false"}:
         raise ValueError("DRY_RUN must be true or false")
 
@@ -67,7 +95,7 @@ def load_config() -> Config:
         machine_id=_integer("MACHINE_ID"),
         vast_api_key=_text("VAST_API_KEY"),
         gemini_api_key=_text("GEMINI_API_KEY"),
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip(),
+        gemini_model=_text("GEMINI_MODEL"),
         gemini_thinking_budget=_integer("GEMINI_THINKING_BUDGET"),
         dry_run=dry_run == "true",
         poll_seconds=_integer("POLL_SECONDS"),
@@ -85,7 +113,7 @@ def load_config() -> Config:
         volume_size_gb=_integer("VOLUME_SIZE_GB"),
         volume_price=_number("VOLUME_PRICE"),
         duration_days=_integer("DURATION_DAYS"),
-        running_cost=_optional_number("GPU_RUNNING_COST", 0.0),
+        running_cost=_number("GPU_RUNNING_COST"),
     )
     if (
         config.machine_id == 0

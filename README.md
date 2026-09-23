@@ -4,12 +4,34 @@ A headless Python service that reads on-demand GPU offers and host market metric
 
 ## Configure
 
-```sh
-cp .env.example .env
-# Provide VAST_API_KEY and GEMINI_API_KEY; review every listing setting.
-```
+`VAST_API_KEY` and `GEMINI_API_KEY` are the only required settings. They live in Doppler project `vastai-hosting`, config `prd`, and this directory is linked to that config. The Vast key must be a host key (market metrics reject client keys) with permission to view offers and manage host machines. `GEMINI_API_KEY` is a [Google AI Studio API key](https://aistudio.google.com/apikey).
 
-`.env.example` includes an example based on machine `51673` (RTX 5090); change it for another host. Obtain a Vast host API key (market metrics reject client keys) with permission to view offers and manage host machines, and a [Google AI Studio API key](https://aistudio.google.com/apikey) for `GEMINI_API_KEY`. `GEMINI_MODEL` defaults to `gemini-flash-latest`. Set `GEMINI_THINKING_BUDGET` explicitly. Optional `GPU_RUNNING_COST` (default `0`) is the extra USD per GPU-hour a rented GPU costs you, such as power; at `0` the service maximizes revenue. All listing fields are explicit: Gemini proposes the GPU price; disk, internet, bid floor, discount, minimum GPU chunk, volume size, volume price, and rolling `DURATION_DAYS` come from configuration. The machine must already be listed.
+Every other setting uses the default in `src/vastai_hosting/config.py` when the variable is unset or blank. These defaults describe machine `51673` (one RTX 5090). Set a variable only to point the service at another host or listing.
+
+| Variable | Default |
+| --- | --- |
+| `GEMINI_MODEL` | `gemini-flash-latest` |
+| `GEMINI_THINKING_BUDGET` | `1024` |
+| `MACHINE_ID` | `51673` |
+| `DRY_RUN` | `true` |
+| `POLL_SECONDS` | `86400` |
+| `MIN_PEERS` | `5` |
+| `OFFER_LIMIT` | `200` |
+| `MIN_PRICE` | `0.40` |
+| `MAX_PRICE` | `1.00` |
+| `MIN_CHANGE` | `0.01` |
+| `GPU_RUNNING_COST` | `0` |
+| `DISK_PRICE` | `0.15` |
+| `UPLOAD_PRICE` | `0.001953125` |
+| `DOWNLOAD_PRICE` | `0.001953125` |
+| `MIN_BID_PRICE` | `0.40` |
+| `DISCOUNT_RATE` | `0.10` |
+| `MIN_CHUNK` | `1` |
+| `VOLUME_SIZE_GB` | `209` |
+| `VOLUME_PRICE` | `0.15` |
+| `DURATION_DAYS` | `7` |
+
+`GPU_RUNNING_COST` is extra USD per GPU-hour while a GPU is rented, such as power. At `0` the service maximizes revenue. Gemini proposes the GPU price; disk, internet, bid floor, discount, minimum GPU chunk, volume size, volume price, and rolling `DURATION_DAYS` come from these settings. The machine must already be listed.
 
 The market query matches **GPU model and exact GPU count**, verified and rentable on-demand offers. Vast returns a different sample of about 55 offers per search, so the service repeats the search until a call adds no new machine (at most 12 calls) and merges the results, excluding the host machine and duplicate machine IDs.
 
@@ -27,12 +49,28 @@ Cycles are skipped with fewer than `MIN_PEERS` usable offers, when any search hi
 
 ## Run
 
+Deploy to `darkhorn` builds the `linux/amd64` image on this machine, loads it on the host, and starts it from `~/apps/vastai-hosting`. The host receives the image, `compose.yml`, and an env file that contains only the two Doppler keys:
+
+```sh
+./scripts/deploy.sh
+ssh darkhorn 'cd ~/apps/vastai-hosting && docker compose logs -f'
+```
+
+The container starts with `DRY_RUN=true`. Add `DRY_RUN=false` in Doppler and run the script again to publish listing updates.
+
+For a local cycle, with [uv](https://docs.astral.sh/uv/) installed:
+
+```sh
+doppler run -- uv run python -m vastai_hosting.main
+```
+
+The same image runs on any host with outbound access to Vast.ai and Gemini. No GPU or Docker socket access is required inside the container. An env file for that path only needs the two API keys (see `.env.example`):
+
 ```sh
 docker build --platform linux/amd64 -t vastai-hosting .
 docker run -d --name vastai-hosting --restart unless-stopped --env-file .env vastai-hosting
-docker logs -f vastai-hosting
 ```
 
-Run on any host with outbound access to Vast.ai and Gemini. No GPU or Docker socket access is required inside the container. For local development, install [uv](https://docs.astral.sh/uv/), then run `uv sync` and `uv run --env-file .env python -m vastai_hosting.main`. Validate with `uv run ruff check .`, `uv run ruff format --check .`, `uv run ty check`, `uv run pytest`, and `uv build`.
+Validate with `uv run ruff check .`, `uv run ruff format --check .`, `uv run ty check`, `uv run pytest`, and `uv build`.
 
 Docs: [search offers](https://docs.vast.ai/sdk/python/quickstart), [show machines](https://docs.vast.ai/host/sdk/show-machines), [list machine](https://docs.vast.ai/host/sdk/list-machine), [Gemini structured output](https://ai.google.dev/gemini-api/docs/generate-content/structured-output).

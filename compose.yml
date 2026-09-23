@@ -1,0 +1,6 @@
+services:
+  vastai-hosting:
+    image: vastai-hosting
+    container_name: vastai-hosting
+    restart: unless-stopped
+    env_file: .env

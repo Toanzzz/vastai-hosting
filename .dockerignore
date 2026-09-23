@@ -1,13 +1,11 @@
+.git
 .venv
 node_modules
 dist
-__pycache__
+target
 .pytest_cache
 .ruff_cache
 .ty
-target
-tests
+__pycache__
 *.egg-info
-.git
 .env
-*.log
