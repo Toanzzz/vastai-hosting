@@ -1,27 +1,35 @@
-# Build natively for the target platform (amd64 for the Vast host).
-FROM rust:1.98-alpine3.22 AS build
-RUN apk add --no-cache musl-dev
+FROM ghcr.io/astral-sh/uv:0.12.17 AS uv
+
+FROM python:3.12-alpine3.22 AS build
+COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY pyproject.toml uv.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+# Vast's PDF, CLI presentation and serverless/async dependencies are not used
+# by show_machines, search_offers or list_machine. Keep the lockfile as the
+# dependency source, omitting these optional SDK paths from the runtime image.
+RUN uv sync --locked --no-dev --no-editable --no-cache \
+    --no-install-package aiodns --no-install-package aiohttp \
+    --no-install-package aiohappyeyeballs --no-install-package aiosignal \
+    --no-install-package argcomplete --no-install-package attrs \
+    --no-install-package borb --no-install-package curlify \
+    --no-install-package fonttools --no-install-package frozenlist \
+    --no-install-package lxml --no-install-package markdown-it-py \
+    --no-install-package mdurl --no-install-package multidict \
+    --no-install-package pillow --no-install-package propcache \
+    --no-install-package psutil --no-install-package pycares \
+    --no-install-package pycryptodome --no-install-package pygments \
+    --no-install-package python-barcode \
+    --no-install-package qrcode --no-install-package rich \
+    --no-install-package setuptools --no-install-package xdg \
+    --no-install-package yarl \
+    && find .venv -type d -name __pycache__ -prune -exec rm -rf {} + \
+    && find .venv -type d -name tests -prune -exec rm -rf {} +
 
-# The official Vast CLI is Python. Install only its CLI runtime dependencies,
-# omitting the optional SDK/serverless/PDF/image stack from the final image.
-FROM python:3.12-alpine3.22 AS cli
-RUN pip install --no-cache-dir --no-deps --target /opt/vendor \
-    vastai==1.8.0 requests==2.34.2 rich==15.0.0 argcomplete==3.7.2 \
-    curlify==3.0.0 python-dateutil==2.9.0.post0 xdg==6.0.0 \
-    urllib3==2.8.0 typing-extensions==4.16.0 certifi==2026.7.22 \
-    charset-normalizer==3.5.1 idna==3.20 markdown-it-py==4.2.0 \
-    pygments==2.21.0 mdurl==0.1.2 six==1.17.0
-
-FROM alpine:3.22
-RUN apk add --no-cache python3 ca-certificates && adduser -D -u 10001 app
-COPY --from=cli /opt/vendor /opt/vendor
-ENV PYTHONPATH=/opt/vendor HOME=/home/app PYTHONUNBUFFERED=1
-# Exec-form wrapper so the CLI uses the system Python without a shell.
-COPY --chmod=755 docker/vastai /usr/local/bin/vastai
-COPY --from=build /app/target/release/vastai-hosting /usr/local/bin/vastai-hosting
+FROM python:3.12-alpine3.22
+RUN adduser -D -u 10001 app
+WORKDIR /app
+COPY --from=build /app/.venv/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/home/app
 USER app
-ENTRYPOINT ["/usr/local/bin/vastai-hosting"]
+ENTRYPOINT ["python", "-m", "vastai_hosting.main"]
