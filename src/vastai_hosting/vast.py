@@ -1,3 +1,5 @@
+import threading
+from collections.abc import Callable
 from math import isfinite
 from time import time
 from typing import Any
@@ -14,10 +16,22 @@ Row = dict[str, Any]
 MAX_SEARCH_CALLS = 12
 
 
+def _serialized[R](method: Callable[..., R]) -> Callable[..., R]:
+    """One Vast client call at a time. A price tap can arrive during a pricing cycle."""
+
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class VastService:
     def __init__(self, config: Config) -> None:
+        self._lock = threading.Lock()
         self._client = VastAI(api_key=config.vast_api_key, retry=1, raw=True)
 
+    @_serialized
     def own_machine(self, config: Config) -> Row:
         try:
             machines = self._client.show_machines()
@@ -32,6 +46,7 @@ class VastService:
             raise ValueError("machine is not listed; list it manually first")
         return machine
 
+    @_serialized
     def search_peers(self, own: Row, config: Config) -> list[Any]:
         gpu_name = own.get("gpu_name")
         gpu_count = own.get("num_gpus")
@@ -68,6 +83,7 @@ class VastService:
             seen |= found
         return batches
 
+    @_serialized
     def own_offers(self, config: Config) -> list[Row]:
         try:
             return self._client.search_offers(
@@ -78,6 +94,7 @@ class VastService:
         except Exception as error:
             raise RuntimeError("Vast own offer request failed") from error
 
+    @_serialized
     def market_metrics(self, own: Row) -> tuple[Any, Any]:
         gpu_name = own.get("gpu_name")
         count = own.get("num_gpus")
@@ -101,6 +118,7 @@ class VastService:
             raise RuntimeError("Vast market metrics request failed") from error
         return current, history
 
+    @_serialized
     def update_listing(self, config: Config, target: float) -> None:
         if not isfinite(target) or not config.min_price <= target <= config.max_price:
             raise ValueError("listing price outside configured bounds")

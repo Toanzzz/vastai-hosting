@@ -4,10 +4,18 @@ from vastai_hosting.config import DEFAULTS, _integer, _number, _optional_number,
 
 
 def _only_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in ("VAST_API_KEY", "GEMINI_API_KEY", *DEFAULTS):
+    for key in (
+        "VAST_API_KEY",
+        "GEMINI_API_KEY",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_SUBSCRIBE_SECRET",
+        *DEFAULTS,
+    ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("VAST_API_KEY", "vast-key")
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:ABC_def")
+    monkeypatch.setenv("TELEGRAM_SUBSCRIBE_SECRET", "join-code")
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-1", "invalid"])
@@ -32,7 +40,9 @@ def test_load_config_needs_only_api_keys(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.machine_id == 51673
     assert config.gemini_model == "gemini-flash-latest"
     assert config.gemini_thinking_budget == 1024
-    assert config.dry_run is True
+    assert config.telegram_bot_token == "123456:ABC_def"
+    assert config.telegram_subscribe_secret == "join-code"
+    assert config.telegram_state_path == "data/subscribers.json"
     assert config.poll_seconds == 86400
     assert config.min_peers == 5
     assert config.offer_limit == 200
@@ -54,32 +64,49 @@ def test_load_config_needs_only_api_keys(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_blank_setting_uses_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
     _only_secrets(monkeypatch)
     monkeypatch.setenv("MACHINE_ID", "  ")
-    monkeypatch.setenv("DRY_RUN", "")
+    monkeypatch.setenv("TELEGRAM_STATE_PATH", "")
     config = load_config()
     assert config.machine_id == 51673
-    assert config.dry_run is True
+    assert config.telegram_state_path == "data/subscribers.json"
 
 
 def test_explicit_setting_overrides_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
     _only_secrets(monkeypatch)
     monkeypatch.setenv("MACHINE_ID", "99")
-    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("TELEGRAM_STATE_PATH", "state/subscribers.json")
     config = load_config()
     assert config.machine_id == 99
-    assert config.dry_run is False
+    assert config.telegram_state_path == "state/subscribers.json"
 
 
-def test_missing_api_key_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "key",
+    ["VAST_API_KEY", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_SUBSCRIBE_SECRET"],
+)
+def test_missing_secret_is_rejected(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
     _only_secrets(monkeypatch)
-    monkeypatch.delenv("VAST_API_KEY")
-    with pytest.raises(ValueError, match="missing VAST_API_KEY"):
+    monkeypatch.delenv(key)
+    with pytest.raises(ValueError, match=f"missing {key}"):
         load_config()
 
 
-def test_invalid_dry_run_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("TELEGRAM_BOT_TOKEN", "not-a-token"),
+        ("TELEGRAM_BOT_TOKEN", "123:bad token"),
+        ("TELEGRAM_SUBSCRIBE_SECRET", "has space"),
+        ("TELEGRAM_SUBSCRIBE_SECRET", "a" * 65),
+        ("TELEGRAM_SUBSCRIBE_SECRET", "bad/char"),
+        ("TELEGRAM_STATE_PATH", "data/\nbad"),
+    ],
+)
+def test_invalid_telegram_setting_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str
+) -> None:
     _only_secrets(monkeypatch)
-    monkeypatch.setenv("DRY_RUN", "yes")
-    with pytest.raises(ValueError, match="DRY_RUN"):
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match=key):
         load_config()
 
 

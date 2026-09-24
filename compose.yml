@@ -4,3 +4,8 @@ services:
     container_name: vastai-hosting
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - telegram-state:/app/data
+
+volumes:
+  telegram-state:

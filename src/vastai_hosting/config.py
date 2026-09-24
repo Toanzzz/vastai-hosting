@@ -1,6 +1,10 @@
 import os
+import re
 from dataclasses import dataclass
 from math import isfinite
+
+_TOKEN = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
+_SECRET = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -10,7 +14,6 @@ class Config:
     gemini_api_key: str
     gemini_model: str
     gemini_thinking_budget: int
-    dry_run: bool
     poll_seconds: int
     min_peers: int
     offer_limit: int
@@ -27,6 +30,9 @@ class Config:
     volume_price: float
     duration_days: int
     running_cost: float
+    telegram_bot_token: str
+    telegram_subscribe_secret: str
+    telegram_state_path: str
 
 
 # Defaults for the one listed host (machine 51673, one RTX 5090).
@@ -35,7 +41,6 @@ DEFAULTS: dict[str, str] = {
     "GEMINI_MODEL": "gemini-flash-latest",
     "GEMINI_THINKING_BUDGET": "1024",
     "MACHINE_ID": "51673",
-    "DRY_RUN": "true",
     "POLL_SECONDS": "86400",
     "MIN_PEERS": "5",
     "OFFER_LIMIT": "200",
@@ -52,6 +57,7 @@ DEFAULTS: dict[str, str] = {
     "VOLUME_SIZE_GB": "209",
     "VOLUME_PRICE": "0.15",
     "DURATION_DAYS": "7",
+    "TELEGRAM_STATE_PATH": "data/subscribers.json",
 }
 
 
@@ -86,18 +92,20 @@ def _integer(key: str) -> int:
     return int(value)
 
 
-def load_config() -> Config:
-    dry_run = _text("DRY_RUN")
-    if dry_run not in {"true", "false"}:
-        raise ValueError("DRY_RUN must be true or false")
+def _secret(key: str, pattern: re.Pattern[str]) -> str:
+    value = _text(key)
+    if pattern.fullmatch(value) is None:
+        raise ValueError(f"invalid {key}")
+    return value
 
+
+def load_config() -> Config:
     config = Config(
         machine_id=_integer("MACHINE_ID"),
         vast_api_key=_text("VAST_API_KEY"),
         gemini_api_key=_text("GEMINI_API_KEY"),
         gemini_model=_text("GEMINI_MODEL"),
         gemini_thinking_budget=_integer("GEMINI_THINKING_BUDGET"),
-        dry_run=dry_run == "true",
         poll_seconds=_integer("POLL_SECONDS"),
         min_peers=_integer("MIN_PEERS"),
         offer_limit=_integer("OFFER_LIMIT"),
@@ -114,7 +122,12 @@ def load_config() -> Config:
         volume_price=_number("VOLUME_PRICE"),
         duration_days=_integer("DURATION_DAYS"),
         running_cost=_number("GPU_RUNNING_COST"),
+        telegram_bot_token=_secret("TELEGRAM_BOT_TOKEN", _TOKEN),
+        telegram_subscribe_secret=_secret("TELEGRAM_SUBSCRIBE_SECRET", _SECRET),
+        telegram_state_path=_text("TELEGRAM_STATE_PATH"),
     )
+    if any(char in config.telegram_state_path for char in "\n\r\0"):
+        raise ValueError("invalid TELEGRAM_STATE_PATH")
     if (
         config.machine_id == 0
         or config.gemini_thinking_budget < 0

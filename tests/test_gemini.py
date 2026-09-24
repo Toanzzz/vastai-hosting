@@ -14,7 +14,6 @@ def config() -> Config:
         gemini_api_key="test",
         gemini_model="gemini-flash-latest",
         gemini_thinking_budget=1024,
-        dry_run=True,
         poll_seconds=1800,
         min_peers=3,
         offer_limit=100,
@@ -31,6 +30,9 @@ def config() -> Config:
         volume_price=0.15,
         duration_days=7,
         running_cost=0.0,
+        telegram_bot_token="123456:ABC_def",
+        telegram_subscribe_secret="subscribe",
+        telegram_state_path="data/subscribers.json",
     )
 
 

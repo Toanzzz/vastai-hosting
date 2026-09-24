@@ -27,7 +27,9 @@ RUN uv sync --locked --no-dev --no-editable --no-cache \
     && find .venv -type d -name tests -prune -exec rm -rf {} +
 
 FROM python:3.12-alpine3.22
-RUN adduser -D -u 10001 app
+RUN adduser -D -u 10001 app \
+    && mkdir -p /app/data \
+    && chown app:app /app/data
 WORKDIR /app
 COPY --from=build /app/.venv/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/home/app

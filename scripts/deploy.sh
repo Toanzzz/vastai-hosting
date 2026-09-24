@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the linux/amd64 image locally, load it on darkhorn, and start it.
-# Doppler project vastai-hosting, config prd, supplies VAST_API_KEY and GEMINI_API_KEY.
+# Doppler project vastai-hosting, config prd, supplies the Vast, Gemini, and Telegram secrets.
 # Every other setting uses the defaults in vastai_hosting.config.
 set -euo pipefail
 
@@ -31,7 +31,7 @@ source, dest = sys.argv[1:]
 with open(source, encoding="utf-8") as handle:
     data = json.load(handle)
 lines: list[str] = []
-for key in ("VAST_API_KEY", "GEMINI_API_KEY"):
+for key in ("VAST_API_KEY", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_SUBSCRIBE_SECRET"):
     value = str(data.get(key, "")).strip()
     if not value or any(char in value for char in "\n\r"):
         raise SystemExit(f"Doppler vastai-hosting/prd is missing a usable {key}")

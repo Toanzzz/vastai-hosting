@@ -5,9 +5,11 @@ Run locally with `uv run python tests/image_smoke.py`, or pipe this file into
 """
 
 import json
+import tempfile
 import time
-from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from httpx import Client, Request, Response
@@ -16,6 +18,9 @@ from vastai.api.client import VastClient
 from vastai_hosting.config import Config
 from vastai_hosting.gemini import GeminiService
 from vastai_hosting.main import run_cycle
+from vastai_hosting.subscribers import Subscribers
+from vastai_hosting.telegram import PriceBot
+from vastai_hosting.telegram_api import TelegramApi
 from vastai_hosting.utilization import UtilizationHistory
 from vastai_hosting.vast import VastService
 
@@ -25,7 +30,6 @@ config = Config(
     gemini_api_key="test-gemini-key",
     gemini_model="gemini-flash-latest",
     gemini_thinking_budget=1024,
-    dry_run=False,
     poll_seconds=1800,
     min_peers=3,
     offer_limit=100,
@@ -42,6 +46,9 @@ config = Config(
     volume_price=0.15,
     duration_days=7,
     running_cost=0.0,
+    telegram_bot_token="123456:ABC_def",
+    telegram_subscribe_secret="subscribe",
+    telegram_state_path="data/subscribers.json",
 )
 
 own = {
@@ -179,20 +186,39 @@ with (
     patch.object(Client, "send", fake_google_send),
 ):
     run_cycle(config, VastService(config), GeminiService(config), history)
-    assert [method for method, _, _ in requests] == [
-        "GET",
-        "POST",
-        "POST",
-        "POST",
-        "GET",
-        "GET",
-        "PUT",
-    ]
+    assert [method for method, _, _ in requests] == ["GET", "POST", "POST", "POST", "GET", "GET"]
 
     requests.clear()
-    dry_run = replace(config, dry_run=True)
-    run_cycle(dry_run, VastService(dry_run), GeminiService(dry_run), history)
-    assert [method for method, _, _ in requests] == ["GET", "POST", "POST", "POST", "GET", "GET"]
+    calls: list[str] = []
+
+    def transport(method: str, _params: dict[str, Any]) -> dict[str, Any]:
+        calls.append(method)
+        return {}
+
+    with tempfile.TemporaryDirectory() as directory:
+        subscribers = Subscribers(Path(directory) / "subscribers.json")
+        assert subscribers.add(7)
+        PriceBot(
+            config,
+            VastService(config),
+            subscribers,
+            TelegramApi(config.telegram_bot_token, transport),
+        ).handle(
+            {
+                "callback_query": {
+                    "id": "cb-1",
+                    "from": {"id": 7},
+                    "data": "p:50",
+                    "message": {
+                        "message_id": 3,
+                        "text": "Machine 42",
+                        "chat": {"id": 7, "type": "private"},
+                    },
+                }
+            }
+        )
+    assert calls == ["answerCallbackQuery", "editMessageText"]
+    assert [method for method, _, _ in requests] == ["PUT"]
 
     requests.clear()
     recommended_text = recommended_text.replace("0.5", "9", 1)
