@@ -7,6 +7,7 @@ from vastai_hosting.pricing import (
     median_peer_price,
     peers_from_search,
     price_changed,
+    price_under_median,
 )
 
 
@@ -111,6 +112,12 @@ def test_listing_settings_and_price_threshold() -> None:
     assert not price_changed(0.5, 0.505, cfg)
     assert price_changed(0.5, 0.52, cfg)
     assert price_changed(0.34, 0.35, cfg)
+
+
+def test_fallback_price_is_two_cents_under_the_median() -> None:
+    assert price_under_median(0.5) == 0.48
+    assert price_under_median(0.375) == 0.36
+    assert price_under_median(0.011) == -0.01
 
 
 def test_nonfinite_offer_prices_are_not_used() -> None:

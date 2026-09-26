@@ -1,6 +1,8 @@
 import io
 import urllib.error
 import urllib.request
+from collections.abc import Callable
+from dataclasses import replace
 from email.message import Message
 from pathlib import Path
 from typing import Any
@@ -56,8 +58,14 @@ def status() -> CycleStatus:
         estimates=((0.55, 0.9), (0.72, 0.8)),
         occupied=True,
         market_usage=61,
+        usage_30d=80,
+        rented_gpus=1227,
+        available_gpus=132,
         peers=42,
+        peer_low=0.4,
+        peer_high=0.9,
         host_share=0.75,
+        median=0.5,
         rationale="Peers are cheaper",
         listing_settings_differ=True,
     )
@@ -91,12 +99,17 @@ class Transport:
 
 
 def build(
-    tmp_path: Path, listing: Listing | None = None, transport: Transport | None = None
+    tmp_path: Path,
+    listing: Listing | None = None,
+    transport: Transport | None = None,
+    on_check: Callable[[], None] | None = None,
 ) -> tuple[PriceBot, Listing, Transport, Subscribers]:
     listing = listing or Listing()
     transport = transport or Transport()
     subscribers = Subscribers(tmp_path / "subscribers.json")
-    bot = PriceBot(config(tmp_path), listing, subscribers, TelegramApi(TOKEN, transport))
+    bot = PriceBot(
+        config(tmp_path), listing, subscribers, TelegramApi(TOKEN, transport), on_check=on_check
+    )
     return bot, listing, transport, subscribers
 
 
@@ -132,18 +145,23 @@ def texts(transport: Transport) -> list[str]:
 
 
 def test_status_message_includes_the_price_button() -> None:
-    text = status_text(status())
-    assert "Machine 42" in text
-    assert "Listed $0.55/GPU-h, suggested $0.72/GPU-h" in text
-    assert "Occupied: yes" in text
-    assert "market usage 61%" in text
-    assert "peers 42" in text
-    assert "host share 0.750" in text
-    assert "Expected occupancy 0.80" in text
-    assert "profit $0.5760/h" in text
-    assert "Estimates: 0.55:0.90 0.72:0.80" in text
-    assert "Listing settings differ from config" in text
-    assert text.endswith("Peers are cheaper")
+    text = status_text(status(), offer_button=True)
+    assert "🖥 <b>Machine 42</b>" in text
+    assert "<b>Listed</b> $0.55/GPU-h" in text
+    assert "<b>Suggested</b> $0.72/GPU-h <i>(+$0.17)</i>" in text
+    assert "Usage now" in text and "61%" in text
+    assert "Usage 30d" in text and "80%" in text
+    assert "1,227" in text and "132" in text
+    assert "Median" in text and "$0.5000" in text
+    assert "Host share" in text and "0.750" in text
+    assert "Occupied" in text and "yes" in text
+    assert "<pre>" in text and "Occupancy" in text
+    assert "$0.55" in text and "0.90" in text
+    assert "←" in text
+    assert "Expected occupancy <b>0.80</b>" in text
+    assert "profit <b>$0.5760</b>/h" in text
+    assert "Listing settings differ from config. Applying also refreshes them." in text
+    assert "<i>Peers are cheaper</i>" in text
     assert parse_cents("p:72") == 72
     assert parse_cents("p:05") is None
 
@@ -159,7 +177,9 @@ def test_start_subscribes_a_private_chat(tmp_path: Path) -> None:
     bot, _listing, transport, subscribers = build(tmp_path)
     bot.handle(message("/start@HostBot join-code"))
     assert subscribers.chats() == (7,)
-    assert texts(transport) == ["Subscribed. Status messages arrive after each pricing cycle."]
+    assert texts(transport) == [
+        "Subscribed. Status arrives after each pricing cycle. Send /check to run one now."
+    ]
     bot.handle(message("/start join-code"))
     assert texts(transport)[-1] == "Already subscribed."
 
@@ -187,8 +207,11 @@ def test_new_subscriber_receives_the_latest_status(tmp_path: Path) -> None:
     assert subscribers.chats() == ()
     bot.handle(message("/start join-code"))
     sent = [params for method, params in transport.calls if method == "sendMessage"]
-    assert sent[0]["text"] == "Subscribed. Status messages arrive after each pricing cycle."
-    assert "suggested $0.72/GPU-h" in str(sent[1]["text"])
+    assert sent[0]["text"] == (
+        "Subscribed. Status arrives after each pricing cycle. Send /check to run one now."
+    )
+    assert "$0.72/GPU-h" in str(sent[1]["text"])
+    assert sent[1]["parse_mode"] == "HTML"
     markup = sent[1]["reply_markup"]
     assert isinstance(markup, dict)
     assert markup["inline_keyboard"][0][0]["callback_data"] == "p:72"
@@ -231,7 +254,8 @@ def test_allowed_callback_updates_the_listing(tmp_path: Path) -> None:
     assert listing.prices == [0.72]
     assert order == ["answerCallbackQuery", "update:0.72", "editMessageText"]
     edited = transport.calls[-1][1]
-    assert edited["text"] == "Machine 42\nApplied."
+    assert edited["text"] == "Machine 42\n✅ <b>Applied.</b>"
+    assert edited["parse_mode"] == "HTML"
     assert edited["reply_markup"]["inline_keyboard"][0][0]["text"] == "Set price to $0.72"
 
 
@@ -296,3 +320,103 @@ def test_network_error_hides_the_bot_token(monkeypatch: pytest.MonkeyPatch) -> N
     message = str(caught.value)
     assert TOKEN not in message
     assert "[redacted]" in message
+
+
+def test_unchanged_price_omits_the_button(tmp_path: Path) -> None:
+    bot, _listing, transport, subscribers = build(tmp_path)
+    assert subscribers.add(7)
+    bot.publish(replace(status(), current=0.72, suggested=0.72))
+    sent = [params for method, params in transport.calls if method == "sendMessage"]
+    assert "reply_markup" not in sent[0]
+    assert sent[0]["parse_mode"] == "HTML"
+    assert "matches the listed price" in str(sent[0]["text"])
+    assert "Applying also refreshes them." not in str(sent[0]["text"])
+
+
+def test_out_of_bounds_price_omits_the_button(tmp_path: Path) -> None:
+    bot, _listing, transport, subscribers = build(tmp_path)
+    assert subscribers.add(7)
+    bot.publish(replace(status(), suggested=0.1))
+    sent = [params for method, params in transport.calls if method == "sendMessage"]
+    assert "reply_markup" not in sent[0]
+    assert "cannot be applied" in str(sent[0]["text"])
+
+
+def test_fallback_and_escaped_rationale_text() -> None:
+    fallback = replace(
+        status(),
+        rationale=None,
+        occupancy=None,
+        hourly_profit=None,
+        estimates=(),
+        current=0.55,
+        suggested=0.48,
+        median=0.5,
+    )
+    text = status_text(fallback, offer_button=True)
+    assert "Gemini unavailable" in text
+    assert "$0.02 under the $0.5000 peer median." in text
+    assert "Estimates" not in text
+    rounded = status_text(
+        replace(fallback, suggested=0.36, median=0.375, current=0.6), offer_button=True
+    )
+    assert "Rounded to the nearest cent." in rounded
+    escaped = status_text(replace(status(), rationale="a < b & c"), offer_button=True)
+    assert "<i>a &lt; b &amp; c</i>" in escaped
+
+
+def test_applied_edit_keeps_the_formatted_status(tmp_path: Path) -> None:
+    class Ids(Transport):
+        def __call__(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            self.order.append(method)
+            self.calls.append((method, params))
+            if method == "sendMessage":
+                return {"message_id": 4}
+            return {"message_id": 1}
+
+    bot, _listing, transport, subscribers = build(tmp_path, transport=Ids())
+    assert subscribers.add(7)
+    bot.publish(status())
+    bot.handle(callback("p:72", text="plain from telegram"))
+    edited = transport.calls[-1][1]
+    assert "plain from telegram" not in str(edited["text"])
+    assert "<b>Machine 42</b>" in str(edited["text"])
+    assert str(edited["text"]).endswith("\n✅ <b>Applied.</b>")
+
+
+def test_check_runs_the_cycle_for_a_subscriber(tmp_path: Path) -> None:
+    calls: list[str] = []
+    bot, _listing, transport, subscribers = build(tmp_path, on_check=lambda: calls.append("go"))
+    assert subscribers.add(7)
+    bot.handle(message("/check@HostBot"))
+    assert calls == ["go"]
+    assert texts(transport) == ["Checking the market…"]
+    bot.handle(message("/check"))
+    assert calls == ["go"]
+    assert texts(transport)[-1] == "A pricing check is already running."
+    bot.publish(status())
+    bot.handle(message("/check"))
+    assert calls == ["go", "go"]
+
+
+def test_check_requires_a_subscription(tmp_path: Path) -> None:
+    calls: list[str] = []
+    bot, _listing, transport, _subscribers = build(tmp_path, on_check=lambda: calls.append("go"))
+    bot.handle(message("/check"))
+    assert calls == []
+    assert texts(transport) == ["Not subscribed."]
+    bot.handle(message("/check", chat_id=-3, chat_type="group"))
+    assert transport.calls == [("sendMessage", transport.calls[0][1])]
+
+
+def test_failed_check_is_reported_only_for_its_cycle(tmp_path: Path) -> None:
+    bot, _listing, transport, subscribers = build(tmp_path, on_check=lambda: None)
+    assert subscribers.add(7)
+    started = bot.pending_epoch()
+    bot.handle(message("/check"))
+    bot.notify_check_failed(started)
+    assert "Pricing check failed." not in texts(transport)
+    bot.notify_check_failed(bot.pending_epoch())
+    assert texts(transport)[-1] == "Pricing check failed."
+    bot.notify_check_failed(bot.pending_epoch())
+    assert texts(transport).count("Pricing check failed.") == 1

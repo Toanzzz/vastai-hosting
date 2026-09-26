@@ -18,6 +18,7 @@ from vastai.api.client import VastClient
 from vastai_hosting.config import Config
 from vastai_hosting.gemini import GeminiService
 from vastai_hosting.main import run_cycle
+from vastai_hosting.pricing import price_under_median
 from vastai_hosting.subscribers import Subscribers
 from vastai_hosting.telegram import PriceBot
 from vastai_hosting.telegram_api import TelegramApi
@@ -222,12 +223,10 @@ with (
 
     requests.clear()
     recommended_text = recommended_text.replace("0.5", "9", 1)
-    try:
-        run_cycle(config, VastService(config), GeminiService(config), history)
-    except ValueError as error:
-        assert "local validation" in str(error)
-    else:
-        raise AssertionError("invalid recommendation was accepted")
+    failed = run_cycle(config, VastService(config), GeminiService(config), history)
+    assert failed.rationale is None
+    assert failed.suggested == price_under_median(0.375)
+    assert failed.suggested != 9
     assert [method for method, _, _ in requests] == ["GET", "POST", "POST", "POST", "GET", "GET"]
 
     requests.clear()

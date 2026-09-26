@@ -1,3 +1,4 @@
+from decimal import ROUND_HALF_UP, Decimal
 from math import isfinite
 from typing import Any
 
@@ -143,6 +144,13 @@ def median_peer_price(peers: list[Row]) -> float:
     if len(prices) % 2:
         return prices[middle]
     return (prices[middle - 1] + prices[middle]) / 2
+
+
+def price_under_median(median: float) -> float:
+    """Cent price $0.02 under the peer median, rounded half-up."""
+    base = Decimal(str(round(median, 4)))
+    cents = (base - Decimal("0.02")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(cents)
 
 
 def _differs(row: Row, key: str, value: float) -> bool:
