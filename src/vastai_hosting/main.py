@@ -14,7 +14,7 @@ from .pricing import (
     price_under_median,
     required_number,
 )
-from .status import CycleStatus
+from .status import CycleStatus, suggestion_choices
 from .subscribers import Subscribers
 from .telegram import PriceBot, redact
 from .utilization import UtilizationHistory, occupied
@@ -94,6 +94,14 @@ def _status(
         estimates = recommendation.estimates
         rationale = recommendation.rationale
         estimate_text = " ".join(f"{price:.2f}:{rented:.2f}" for price, rented in estimates)
+    choices = suggestion_choices(
+        estimates,
+        running_cost=config.running_cost,
+        current=current,
+        suggested=suggested,
+        occupancy=occupancy,
+        hourly_profit=hourly_profit,
+    )
     settings_changed = listing_changed(own, config, at)
     rented = "n/a" if occupancy is None else f"{occupancy:.2f}"
     profit = "n/a" if hourly_profit is None else f"${hourly_profit:.4f}/h"
@@ -114,6 +122,7 @@ def _status(
         occupancy=occupancy,
         hourly_profit=hourly_profit,
         estimates=estimates,
+        choices=choices,
         occupied=state,
         market_usage=_number(demand, "usagePercent"),
         usage_30d=_number(demand, "usagePercent30d"),

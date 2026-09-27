@@ -134,6 +134,9 @@ def test_gemini_failure_suggests_two_cents_under_the_median() -> None:
     assert result.peer_high == pytest.approx(0.45)
     assert result.market_usage == 90.3
     assert result.current == 0.6
+    assert len(result.choices) == 1
+    assert result.choices[0].price == 0.36
+    assert result.choices[0].hourly_profit is None
 
 
 def test_invalid_gemini_answer_uses_the_same_fallback() -> None:
@@ -148,6 +151,10 @@ def test_gemini_recommendation_is_kept() -> None:
     assert result.suggested == 0.5
     assert result.rationale == "Peer prices"
     assert result.occupancy == 0.9
+    assert [choice.price for choice in result.choices] == [0.5, 0.6, 0.7]
+    assert result.choices[0].hourly_profit == pytest.approx(0.45)
+    assert result.choices[1].hourly_profit == pytest.approx(0.36)
+    assert result.choices[2].hourly_profit == pytest.approx(0.21)
 
 
 def test_market_failure_still_skips_the_suggestion() -> None:

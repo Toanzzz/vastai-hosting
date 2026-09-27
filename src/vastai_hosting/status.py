@@ -3,6 +3,17 @@ from typing import Any
 
 from .config import Config
 
+# 30-day month. Monthly profit is expected hourly profit times this.
+HOURS_PER_MONTH = 24 * 30
+EXTRA_SUGGESTIONS = 2
+
+
+@dataclass(frozen=True, slots=True)
+class PriceChoice:
+    price: float
+    occupancy: float | None
+    hourly_profit: float | None
+
 
 @dataclass(frozen=True, slots=True)
 class CycleStatus:
@@ -12,6 +23,7 @@ class CycleStatus:
     occupancy: float | None
     hourly_profit: float | None
     estimates: tuple[tuple[float, float], ...]
+    choices: tuple[PriceChoice, ...]
     occupied: bool | None
     market_usage: float
     usage_30d: float
@@ -69,16 +81,25 @@ def _table(rows: list[tuple[str, str]]) -> str:
 def _price_block(status: CycleStatus) -> str:
     listed = _money(status.current)
     if price_cents(status.current) == price_cents(status.suggested):
-        return (
-            f"💰 <b>Listed</b> {listed}/GPU-h\n✅ <i>Suggested price matches the listed price.</i>"
+        lines = [
+            f"💰 <b>Listed</b> {listed}/GPU-h",
+            "✅ <i>Suggested price matches the listed price.</i>",
+        ]
+    else:
+        delta = status.suggested - status.current
+        sign = "+" if delta > 0 else "-"
+        change = f"{sign}{_money(abs(delta))}"
+        lines = [
+            f"💰 <b>Listed</b> {listed}/GPU-h",
+            f"✨ <b>Suggested</b> {_money(status.suggested)}/GPU-h <i>({escape_html(change)})</i>",
+        ]
+    if status.hourly_profit is not None and status.occupancy is not None:
+        monthly = status.hourly_profit * HOURS_PER_MONTH
+        lines.append(
+            f"💵 Occupancy <b>{status.occupancy:.2f}</b> · "
+            f"<b>{_money(status.hourly_profit, 4)}</b>/h · <b>{_money(monthly, 2)}</b>/mo"
         )
-    delta = status.suggested - status.current
-    sign = "+" if delta > 0 else "-"
-    change = f"{sign}{_money(abs(delta))}"
-    return (
-        f"💰 <b>Listed</b> {listed}/GPU-h\n"
-        f"✨ <b>Suggested</b> {_money(status.suggested)}/GPU-h <i>({escape_html(change)})</i>"
-    )
+    return "\n".join(lines)
 
 
 def _market_block(status: CycleStatus) -> str:
@@ -99,13 +120,30 @@ def _market_block(status: CycleStatus) -> str:
     return f"📊 <b>Market</b>\n{table}"
 
 
-def _estimates_block(status: CycleStatus) -> str:
+def _suggestions_block(status: CycleStatus) -> str:
     chosen = price_cents(status.suggested)
-    lines = [f"{'Price':<8}{'Occupancy':>9}"]
-    for price, occupancy in status.estimates:
-        mark = "  ←" if price_cents(price) == chosen else ""
-        lines.append(f"${price:<7.2f}{occupancy:>9.2f}{mark}")
-    return f"📈 <b>Estimates</b>\n<pre>{escape_html('\n'.join(lines))}</pre>"
+    rows: list[tuple[str, str, str, str, str]] = [("Price", "Occ", "$/h", "$/mo", "")]
+    for choice in status.choices:
+        mark = "  ←" if price_cents(choice.price) == chosen else ""
+        if choice.occupancy is None or choice.hourly_profit is None:
+            occupancy, hourly, monthly = "n/a", "n/a", "n/a"
+        else:
+            occupancy = f"{choice.occupancy:.2f}"
+            hourly = _money(choice.hourly_profit, 4)
+            monthly = _money(choice.hourly_profit * HOURS_PER_MONTH, 2)
+        rows.append((f"${choice.price:.2f}", occupancy, hourly, monthly, mark))
+    widths = [max(len(row[index]) for row in rows) for index in range(4)]
+    lines: list[str] = []
+    for row in rows:
+        cells = (
+            row[0].ljust(widths[0]),
+            row[1].rjust(widths[1]),
+            row[2].rjust(widths[2]),
+            row[3].rjust(widths[3]),
+        )
+        lines.append("  ".join(cells) + row[4])
+    table = f"<pre>{escape_html('\n'.join(lines))}</pre>"
+    return f"💡 <b>Suggestions</b>\n{table}\n<i>$/mo is 30 days at that occupancy.</i>"
 
 
 def _fallback_block(status: CycleStatus) -> str:
@@ -127,13 +165,8 @@ def status_text(status: CycleStatus, *, offer_button: bool) -> str:
     if status.rationale is None:
         parts.append(_fallback_block(status))
     else:
-        if status.estimates:
-            parts.append(_estimates_block(status))
-        if status.occupancy is not None and status.hourly_profit is not None:
-            parts.append(
-                f"💵 Expected occupancy <b>{status.occupancy:.2f}</b> · "
-                f"profit <b>{_money(status.hourly_profit, 4)}</b>/h"
-            )
+        if len(status.choices) > 1:
+            parts.append(_suggestions_block(status))
         parts.append(f"💬 <i>{escape_html(status.rationale)}</i>")
     if status.listing_settings_differ:
         refresh = " Applying also refreshes them." if offer_button else ""
@@ -149,10 +182,72 @@ def keyboard(price: float) -> dict[str, Any]:
     return {"inline_keyboard": [[button]]}
 
 
+def _in_bounds(price: float, config: Config) -> bool:
+    return config.min_price <= price <= config.max_price and price >= config.min_bid_price
+
+
+def _choice_button(choice: PriceChoice, *, best: bool) -> dict[str, str]:
+    cents = price_cents(choice.price)
+    label = f"${cents / 100:.2f}"
+    if choice.hourly_profit is None:
+        text = f"Set price to {label}"
+    else:
+        monthly = _money(choice.hourly_profit * HOURS_PER_MONTH, 2)
+        prefix = "Best" if best else "Set"
+        text = f"{prefix} {label} · {monthly}/mo"
+    return {"text": text, "callback_data": f"p:{cents}"}
+
+
 def apply_keyboard(status: CycleStatus, config: Config) -> dict[str, Any] | None:
-    price = status.suggested
-    if price_cents(price) == price_cents(status.current):
+    rows = [
+        [_choice_button(choice, best=index == 0)]
+        for index, choice in enumerate(status.choices)
+        if price_cents(choice.price) != price_cents(status.current)
+        and _in_bounds(choice.price, config)
+    ]
+    if not rows:
         return None
-    if not config.min_price <= price <= config.max_price or price < config.min_bid_price:
-        return None
-    return keyboard(price)
+    return {"inline_keyboard": rows}
+
+
+def suggestion_choices(
+    estimates: tuple[tuple[float, float], ...],
+    *,
+    running_cost: float,
+    current: float,
+    suggested: float,
+    occupancy: float | None,
+    hourly_profit: float | None,
+) -> tuple[PriceChoice, ...]:
+    """Best price, then up to two more by expected hourly profit."""
+    if hourly_profit is None or not estimates:
+        return (PriceChoice(suggested, occupancy, hourly_profit),)
+
+    def earned(price: float, rented: float) -> float:
+        return rented * (price - running_cost)
+
+    def sort_key(item: tuple[float, float]) -> tuple[float, float]:
+        price, rented = item
+        return (round(earned(price, rented), 6), -abs(price - current))
+
+    ranked = sorted(estimates, key=sort_key, reverse=True)
+    suggested_cents = price_cents(suggested)
+    primary = next((item for item in ranked if price_cents(item[0]) == suggested_cents), None)
+    picked: list[tuple[float, float]] = []
+    if primary is None:
+        picked.append((suggested, 0.0 if occupancy is None else occupancy))
+    else:
+        picked.append(primary)
+    for item in ranked:
+        if len(picked) >= 1 + EXTRA_SUGGESTIONS:
+            break
+        if any(price_cents(item[0]) == price_cents(price) for price, _rented in picked):
+            continue
+        picked.append(item)
+    choices: list[PriceChoice] = []
+    for price, rented in picked:
+        if price_cents(price) == suggested_cents:
+            choices.append(PriceChoice(price, rented, hourly_profit))
+        else:
+            choices.append(PriceChoice(price, rented, earned(price, rented)))
+    return tuple(choices)

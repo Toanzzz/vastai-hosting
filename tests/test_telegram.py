@@ -10,7 +10,13 @@ from typing import Any
 import pytest
 
 from vastai_hosting.config import Config
-from vastai_hosting.status import CycleStatus, parse_cents, status_text
+from vastai_hosting.status import (
+    CycleStatus,
+    PriceChoice,
+    parse_cents,
+    status_text,
+    suggestion_choices,
+)
 from vastai_hosting.subscribers import Subscribers
 from vastai_hosting.telegram import PriceBot
 from vastai_hosting.telegram_api import TelegramApi, TelegramError
@@ -49,13 +55,22 @@ def config(tmp_path: Path) -> Config:
 
 
 def status() -> CycleStatus:
+    estimates = ((0.55, 0.9), (0.72, 0.8), (0.8, 0.4))
     return CycleStatus(
         machine_id=42,
         current=0.55,
         suggested=0.72,
         occupancy=0.8,
         hourly_profit=0.576,
-        estimates=((0.55, 0.9), (0.72, 0.8)),
+        estimates=estimates,
+        choices=suggestion_choices(
+            estimates,
+            running_cost=0.0,
+            current=0.55,
+            suggested=0.72,
+            occupancy=0.8,
+            hourly_profit=0.576,
+        ),
         occupied=True,
         market_usage=61,
         usage_30d=80,
@@ -144,6 +159,29 @@ def texts(transport: Transport) -> list[str]:
     ]
 
 
+def test_suggestions_keep_the_best_price_and_two_alternatives() -> None:
+    choices = suggestion_choices(
+        ((0.45, 0.9), (0.5, 0.8), (0.6, 0.5), (0.7, 0.2)),
+        running_cost=0.0,
+        current=0.5,
+        suggested=0.45,
+        occupancy=0.9,
+        hourly_profit=0.405,
+    )
+    assert [choice.price for choice in choices] == [0.45, 0.5, 0.6]
+    assert choices[0].hourly_profit == pytest.approx(0.405)
+    assert choices[1].hourly_profit == pytest.approx(0.4)
+    tied = suggestion_choices(
+        ((0.4, 1.0), (0.5, 0.8), (0.8, 0.5)),
+        running_cost=0.0,
+        current=0.5,
+        suggested=0.5,
+        occupancy=0.8,
+        hourly_profit=0.4,
+    )
+    assert [choice.price for choice in tied] == [0.5, 0.4, 0.8]
+
+
 def test_status_message_includes_the_price_button() -> None:
     text = status_text(status(), offer_button=True)
     assert "🖥 <b>Machine 42</b>" in text
@@ -155,11 +193,12 @@ def test_status_message_includes_the_price_button() -> None:
     assert "Median" in text and "$0.5000" in text
     assert "Host share" in text and "0.750" in text
     assert "Occupied" in text and "yes" in text
-    assert "<pre>" in text and "Occupancy" in text
-    assert "$0.55" in text and "0.90" in text
+    assert "<pre>" in text and "$/mo" in text
+    assert "$0.55" in text and "0.90" in text and "$356.40" in text
+    assert "$414.72" in text and "$230.40" in text
     assert "←" in text
-    assert "Expected occupancy <b>0.80</b>" in text
-    assert "profit <b>$0.5760</b>/h" in text
+    assert "Occupancy <b>0.80</b>" in text
+    assert "<b>$0.5760</b>/h · <b>$414.72</b>/mo" in text
     assert "Listing settings differ from config. Applying also refreshes them." in text
     assert "<i>Peers are cheaper</i>" in text
     assert parse_cents("p:72") == 72
@@ -214,7 +253,10 @@ def test_new_subscriber_receives_the_latest_status(tmp_path: Path) -> None:
     assert sent[1]["parse_mode"] == "HTML"
     markup = sent[1]["reply_markup"]
     assert isinstance(markup, dict)
-    assert markup["inline_keyboard"][0][0]["callback_data"] == "p:72"
+    rows = markup["inline_keyboard"]
+    assert [row[0]["callback_data"] for row in rows] == ["p:72", "p:80"]
+    assert rows[0][0]["text"] == "Best $0.72 · $414.72/mo"
+    assert rows[1][0]["text"] == "Set $0.80 · $230.40/mo"
 
 
 @pytest.mark.parametrize(
@@ -322,21 +364,20 @@ def test_network_error_hides_the_bot_token(monkeypatch: pytest.MonkeyPatch) -> N
     assert "[redacted]" in message
 
 
-def test_unchanged_price_omits_the_button(tmp_path: Path) -> None:
+def test_unchanged_price_omits_only_that_button(tmp_path: Path) -> None:
     bot, _listing, transport, subscribers = build(tmp_path)
     assert subscribers.add(7)
     bot.publish(replace(status(), current=0.72, suggested=0.72))
     sent = [params for method, params in transport.calls if method == "sendMessage"]
-    assert "reply_markup" not in sent[0]
-    assert sent[0]["parse_mode"] == "HTML"
+    rows = sent[0]["reply_markup"]["inline_keyboard"]
+    assert [row[0]["callback_data"] for row in rows] == ["p:55", "p:80"]
     assert "matches the listed price" in str(sent[0]["text"])
-    assert "Applying also refreshes them." not in str(sent[0]["text"])
 
 
 def test_out_of_bounds_price_omits_the_button(tmp_path: Path) -> None:
     bot, _listing, transport, subscribers = build(tmp_path)
     assert subscribers.add(7)
-    bot.publish(replace(status(), suggested=0.1))
+    bot.publish(replace(status(), suggested=0.1, choices=(PriceChoice(0.1, None, None),)))
     sent = [params for method, params in transport.calls if method == "sendMessage"]
     assert "reply_markup" not in sent[0]
     assert "cannot be applied" in str(sent[0]["text"])
@@ -349,6 +390,7 @@ def test_fallback_and_escaped_rationale_text() -> None:
         occupancy=None,
         hourly_profit=None,
         estimates=(),
+        choices=(PriceChoice(0.48, None, None),),
         current=0.55,
         suggested=0.48,
         median=0.5,
