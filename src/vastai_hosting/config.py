@@ -15,14 +15,16 @@ class Config:
     gemini_model: str
     gemini_thinking_budget: int
     poll_seconds: int
+    sample_seconds: int
     min_peers: int
     offer_limit: int
     min_price: float
     max_price: float
     min_change: float
-    disk_price: float
-    upload_price: float
-    download_price: float
+    min_disk_price: float
+    max_disk_price: float
+    min_bandwidth_price: float
+    max_bandwidth_price: float
     min_bid_price: float
     discount_rate: float
     min_chunk: int
@@ -33,6 +35,7 @@ class Config:
     telegram_bot_token: str
     telegram_subscribe_secret: str
     telegram_state_path: str
+    history_state_path: str
 
 
 # Defaults for the one listed host (machine 51673, one RTX 5090).
@@ -42,15 +45,17 @@ DEFAULTS: dict[str, str] = {
     "GEMINI_THINKING_BUDGET": "1024",
     "MACHINE_ID": "51673",
     "POLL_SECONDS": "86400",
+    "SAMPLE_SECONDS": "3600",
     "MIN_PEERS": "5",
     "OFFER_LIMIT": "200",
     "MIN_PRICE": "0.40",
     "MAX_PRICE": "1.00",
     "MIN_CHANGE": "0.01",
     "GPU_RUNNING_COST": "0",
-    "DISK_PRICE": "0.15",
-    "UPLOAD_PRICE": "0.001953125",
-    "DOWNLOAD_PRICE": "0.001953125",
+    "MIN_DISK_PRICE": "0.05",
+    "MAX_DISK_PRICE": "0.40",
+    "MIN_BANDWIDTH_PRICE": "1.00",
+    "MAX_BANDWIDTH_PRICE": "10.00",
     "MIN_BID_PRICE": "0.40",
     "DISCOUNT_RATE": "0.10",
     "MIN_CHUNK": "1",
@@ -58,7 +63,20 @@ DEFAULTS: dict[str, str] = {
     "VOLUME_PRICE": "0.15",
     "DURATION_DAYS": "7",
     "TELEGRAM_STATE_PATH": "data/subscribers.json",
+    "HISTORY_STATE_PATH": "data/occupancy.json",
 }
+
+
+def redact(text: str, config: Config) -> str:
+    for secret in (
+        config.telegram_bot_token,
+        config.telegram_subscribe_secret,
+        config.vast_api_key,
+        config.gemini_api_key,
+    ):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return text
 
 
 def _text(key: str) -> str:
@@ -107,14 +125,16 @@ def load_config() -> Config:
         gemini_model=_text("GEMINI_MODEL"),
         gemini_thinking_budget=_integer("GEMINI_THINKING_BUDGET"),
         poll_seconds=_integer("POLL_SECONDS"),
+        sample_seconds=_integer("SAMPLE_SECONDS"),
         min_peers=_integer("MIN_PEERS"),
         offer_limit=_integer("OFFER_LIMIT"),
         min_price=_number("MIN_PRICE"),
         max_price=_number("MAX_PRICE"),
         min_change=_number("MIN_CHANGE"),
-        disk_price=_number("DISK_PRICE"),
-        upload_price=_number("UPLOAD_PRICE"),
-        download_price=_number("DOWNLOAD_PRICE"),
+        min_disk_price=_number("MIN_DISK_PRICE"),
+        max_disk_price=_number("MAX_DISK_PRICE"),
+        min_bandwidth_price=_number("MIN_BANDWIDTH_PRICE"),
+        max_bandwidth_price=_number("MAX_BANDWIDTH_PRICE"),
         min_bid_price=_number("MIN_BID_PRICE"),
         discount_rate=_number("DISCOUNT_RATE"),
         min_chunk=_integer("MIN_CHUNK"),
@@ -125,18 +145,24 @@ def load_config() -> Config:
         telegram_bot_token=_secret("TELEGRAM_BOT_TOKEN", _TOKEN),
         telegram_subscribe_secret=_secret("TELEGRAM_SUBSCRIBE_SECRET", _SECRET),
         telegram_state_path=_text("TELEGRAM_STATE_PATH"),
+        history_state_path=_text("HISTORY_STATE_PATH"),
     )
     if any(char in config.telegram_state_path for char in "\n\r\0"):
         raise ValueError("invalid TELEGRAM_STATE_PATH")
+    if any(char in config.history_state_path for char in "\n\r\0"):
+        raise ValueError("invalid HISTORY_STATE_PATH")
     if (
         config.machine_id == 0
         or config.gemini_thinking_budget < 0
         or config.poll_seconds < 60
+        or not 60 <= config.sample_seconds <= config.poll_seconds
         or config.min_peers < 3
         or config.offer_limit < config.min_peers
         or config.offer_limit > 1000
         or config.min_price <= 0
         or config.max_price < config.min_price
+        or config.max_disk_price < config.min_disk_price
+        or config.max_bandwidth_price < config.min_bandwidth_price
         or config.min_change <= 0
         or config.min_chunk == 0
         or config.discount_rate > 1

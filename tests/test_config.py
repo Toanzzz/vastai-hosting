@@ -50,9 +50,10 @@ def test_load_config_needs_only_api_keys(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.max_price == 1.00
     assert config.min_change == 0.01
     assert config.running_cost == 0.0
-    assert config.disk_price == 0.15
-    assert config.upload_price == 0.001953125
-    assert config.download_price == 0.001953125
+    assert config.sample_seconds == 3600
+    assert config.history_state_path == "data/occupancy.json"
+    assert (config.min_disk_price, config.max_disk_price) == (0.05, 0.40)
+    assert (config.min_bandwidth_price, config.max_bandwidth_price) == (1.0, 10.0)
     assert config.min_bid_price == 0.40
     assert config.discount_rate == 0.10
     assert config.min_chunk == 1
@@ -107,6 +108,24 @@ def test_invalid_telegram_setting_is_rejected(
     _only_secrets(monkeypatch)
     monkeypatch.setenv(key, value)
     with pytest.raises(ValueError, match=key):
+        load_config()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("SAMPLE_SECONDS", "30"),
+        ("SAMPLE_SECONDS", "90000"),
+        ("MAX_DISK_PRICE", "0.01"),
+        ("MIN_BANDWIDTH_PRICE", "20"),
+    ],
+)
+def test_invalid_rate_or_sample_setting_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, key: str, value: str
+) -> None:
+    _only_secrets(monkeypatch)
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError, match="invalid pricing"):
         load_config()
 
 

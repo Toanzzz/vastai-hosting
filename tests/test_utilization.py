@@ -1,4 +1,34 @@
+from pathlib import Path
+
 from vastai_hosting.utilization import UtilizationHistory, occupied
+
+
+def test_history_survives_a_restart(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "occupancy.json"
+    history = UtilizationHistory(3600, path=path)
+    history.record(1_000_000.0, 0.55, False)
+    history.record(1_003_600.0, 0.55, True)
+    restored = UtilizationHistory(3600, path=path)
+    assert restored.summary() == history.summary()
+    assert restored.summary()["rentalsStarted"] == 1
+
+
+def test_unreadable_history_starts_empty(tmp_path: Path) -> None:
+    path = tmp_path / "occupancy.json"
+    for text in ("not json", '{"observations": [[1, 0.5, "yes"]]}', "[]"):
+        path.write_text(text)
+        assert UtilizationHistory(3600, path=path).summary()["currentlyOccupied"] is None
+
+
+def test_state_changes_report_the_previous_state_duration() -> None:
+    changes: list[tuple[bool, float, float]] = []
+    history = UtilizationHistory(3600, on_change=lambda *change: changes.append(change))
+    history.record(0.0, 0.5, False)
+    history.record(3600.0, 0.5, False)
+    history.record(7200.0, 0.554, True)
+    history.record(10_800.0, 0.55, True)
+    history.record(18_000.0, 0.55, False)
+    assert changes == [(True, 0.55, 2.0), (False, 0.55, 3.0)]
 
 
 def test_occupancy_reads_on_demand_rentals() -> None:

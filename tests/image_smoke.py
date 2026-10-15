@@ -16,8 +16,8 @@ from httpx import Client, Request, Response
 from vastai.api.client import VastClient
 
 from vastai_hosting.config import Config
+from vastai_hosting.cycle import run_cycle
 from vastai_hosting.gemini import GeminiService
-from vastai_hosting.main import run_cycle
 from vastai_hosting.pricing import price_under_median
 from vastai_hosting.subscribers import Subscribers
 from vastai_hosting.telegram import PriceBot
@@ -32,14 +32,16 @@ config = Config(
     gemini_model="gemini-flash-latest",
     gemini_thinking_budget=1024,
     poll_seconds=1800,
+    sample_seconds=600,
     min_peers=3,
     offer_limit=100,
     min_price=0.35,
     max_price=0.8,
     min_change=0.01,
-    disk_price=0.15,
-    upload_price=0.01,
-    download_price=0.01,
+    min_disk_price=0.05,
+    max_disk_price=0.4,
+    min_bandwidth_price=1.0,
+    max_bandwidth_price=10.0,
     min_bid_price=0.3,
     discount_rate=0.1,
     min_chunk=1,
@@ -50,6 +52,7 @@ config = Config(
     telegram_bot_token="123456:ABC_def",
     telegram_subscribe_secret="subscribe",
     telegram_state_path="data/subscribers.json",
+    history_state_path="data/occupancy.json",
 )
 
 own = {
@@ -114,6 +117,12 @@ recommended_text = json.dumps(
             {"price": 0.6, "occupancy": 0.6},
             {"price": 0.7, "occupancy": 0.3},
         ],
+        "rates": {
+            "diskPrice": 0.15,
+            "uploadPricePerTb": 4,
+            "downloadPricePerTb": 4,
+            "rationale": "Peer rates",
+        },
         "rationale": "Peer prices",
     }
 )
@@ -149,6 +158,8 @@ def fake_request(self, method, url, headers, json_data=None, timeout=None):
         assert isinstance(json_data, dict)
         assert json_data["machine"] == 42
         assert json_data["price_gpu"] == 0.5
+        assert json_data["price_disk"] == 0.15
+        assert json_data["price_inetu"] == 0.01
         assert json_data["price_min_bid"] == 0.3
         assert json_data["duration"] == "7 days"
         assert json_data["vol_size"] == 200
@@ -165,6 +176,7 @@ def fake_google_send(self, request: Request, **kwargs):
     assert body["generationConfig"]["responseMimeType"] == "application/json"
     assert body["generationConfig"]["responseJsonSchema"]["required"] == [
         "candidates",
+        "rates",
         "rationale",
     ]
     assert body["generationConfig"]["thinkingConfig"]["thinking_budget"] == 1024
@@ -209,7 +221,7 @@ with (
                 "callback_query": {
                     "id": "cb-1",
                     "from": {"id": 7},
-                    "data": "p:50",
+                    "data": f"p:50:{int(time.time())}",
                     "message": {
                         "message_id": 3,
                         "text": "Machine 42",
@@ -219,7 +231,7 @@ with (
             }
         )
     assert calls == ["answerCallbackQuery", "editMessageText"]
-    assert [method for method, _, _ in requests] == ["PUT"]
+    assert [method for method, _, _ in requests] == ["GET", "PUT"]
 
     requests.clear()
     recommended_text = recommended_text.replace("0.5", "9", 1)

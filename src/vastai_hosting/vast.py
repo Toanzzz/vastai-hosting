@@ -9,6 +9,8 @@ from vastai.api import metrics
 
 from .config import Config
 from .demand import DEMAND_HISTORY_DAYS, DEMAND_STEP_HOURS
+from .pricing import GB_PER_TB
+from .rates import Rates
 
 Row = dict[str, Any]
 
@@ -119,18 +121,20 @@ class VastService:
         return current, history
 
     @_serialized
-    def update_listing(self, config: Config, target: float) -> None:
-        if not isfinite(target) or not config.min_price <= target <= config.max_price:
-            raise ValueError("listing price outside configured bounds")
-        if target < config.min_bid_price:
+    def update_listing(self, config: Config, gpu: float, rates: Rates) -> None:
+        """Write the whole listing. Callers check the tapped values against configured bounds."""
+        values = (gpu, rates.disk, rates.upload, rates.download)
+        if not all(isfinite(value) and value >= 0 for value in values):
+            raise ValueError("invalid listing price")
+        if gpu < config.min_bid_price:
             raise ValueError("listing price below minimum bid")
         try:
             result = self._client.list_machine(
                 id=config.machine_id,
-                price_gpu=target,
-                price_disk=config.disk_price,
-                price_inetu=config.upload_price,
-                price_inetd=config.download_price,
+                price_gpu=gpu,
+                price_disk=rates.disk,
+                price_inetu=rates.upload / GB_PER_TB,
+                price_inetd=rates.download / GB_PER_TB,
                 price_min_bid=config.min_bid_price,
                 discount_rate=config.discount_rate,
                 min_chunk=config.min_chunk,

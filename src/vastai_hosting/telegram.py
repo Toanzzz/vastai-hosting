@@ -4,30 +4,40 @@ from collections.abc import Callable
 from hmac import compare_digest
 from typing import Any, Protocol, TypeGuard
 
+from .buttons import (
+    Dismiss,
+    SetGpu,
+    SetRates,
+    applied_keyboard,
+    applied_note,
+    expired,
+    in_bounds,
+    parse_action,
+)
 from .checks import CheckGate
-from .config import Config
-from .status import CycleStatus, apply_keyboard, escape_html, keyboard, parse_cents, status_text
+from .config import Config, redact
+from .messenger import Messenger
+from .pricing import required_number
+from .rates import Rates, listed_rates
+from .status import CycleStatus, rental_text
 from .subscribers import Subscribers
 from .telegram_api import TelegramApi, TelegramError
 
 # answerCallbackQuery must return before the client gives up on the button.
 _POLL_SECONDS = 50
+_COMMANDS = [
+    {"command": "check", "description": "Run a pricing check now"},
+    {"command": "status", "description": "Resend the latest report"},
+    {"command": "stop", "description": "Unsubscribe"},
+]
+
+Row = dict[str, Any]
 
 
 class _Listing(Protocol):
-    def update_listing(self, config: Config, target: float) -> None: ...
+    def own_machine(self, config: Config) -> Row: ...
 
-
-def redact(text: str, config: Config) -> str:
-    for secret in (
-        config.telegram_bot_token,
-        config.telegram_subscribe_secret,
-        config.vast_api_key,
-        config.gemini_api_key,
-    ):
-        if secret:
-            text = text.replace(secret, "[redacted]")
-    return text
+    def update_listing(self, config: Config, gpu: float, rates: Rates) -> None: ...
 
 
 class PriceBot:
@@ -43,15 +53,19 @@ class PriceBot:
         self._vast = vast
         self._subscribers = subscribers
         self._api = api or TelegramApi(config.telegram_bot_token)
+        self._out = Messenger(config, self._api, subscribers)
         self._on_check = on_check
         self._last: CycleStatus | None = None
         self._status_lock = threading.Lock()
         self._checks = CheckGate()
-        self._sent: dict[tuple[int, int], str] = {}
 
     def start(self) -> None:
         username = self._username()
         label = f"@{username}" if username else "bot"
+        try:
+            self._api.call("setMyCommands", commands=_COMMANDS)
+        except TelegramError as error:
+            print(f"telegram setMyCommands failed: {redact(str(error), self._config)}")
         print(f"telegram {label} polling")
         threading.Thread(target=self._poll, name="telegram", daemon=True).start()
 
@@ -63,11 +77,16 @@ class PriceBot:
             self._last = status
         self._checks.take(epoch)
         for chat_id in self._subscribers.chats():
-            self._send_status(chat_id, status)
+            self._out.send_status(chat_id, status)
 
     def notify_check_failed(self, epoch: int) -> None:
         for chat_id in self._checks.take(epoch):
-            self._reply(chat_id, "Pricing check failed.")
+            self._out.reply(chat_id, "Pricing check failed.")
+
+    def notify_rental(self, started: bool, price: float, hours: float) -> None:
+        text = rental_text(self._config.machine_id, started, price, hours)
+        for chat_id in self._subscribers.chats():
+            self._out.reply(chat_id, text)
 
     def handle(self, update: dict[str, Any]) -> None:
         if isinstance(update.get("message"), dict):
@@ -132,55 +151,64 @@ class PriceBot:
             self._unsubscribe(chat_id)
         elif name == "/check":
             self._request_check(chat_id)
+        elif name == "/status":
+            self._resend(chat_id)
 
     def _subscribe(self, chat_id: int, argument: str) -> None:
         if not compare_digest(argument, self._config.telegram_subscribe_secret):
-            self._reply(chat_id, "Subscription refused.")
+            self._out.reply(chat_id, "Subscription refused.")
             return
         try:
             added = self._subscribers.add(chat_id)
         except OSError as error:
             detail = redact(str(error), self._config)
             print(f"telegram subscribe failed for chat {chat_id}: {detail}")
-            self._reply(chat_id, "Subscription failed.")
+            self._out.reply(chat_id, "Subscription failed.")
             return
-        if added:
-            print(f"telegram chat {chat_id} subscribed")
-            self._reply(
-                chat_id,
-                "Subscribed. Status arrives after each pricing cycle. Send /check to run one now.",
-            )
-            with self._status_lock:
-                status = self._last
-            if status is not None:
-                self._send_status(chat_id, status)
-        else:
-            self._reply(chat_id, "Already subscribed.")
+        if not added:
+            self._out.reply(chat_id, "Already subscribed.")
+            return
+        print(f"telegram chat {chat_id} subscribed")
+        self._out.reply(
+            chat_id,
+            "Subscribed. Status arrives after each pricing cycle. "
+            "Send /check to run one now, or /status for the latest.",
+        )
+        with self._status_lock:
+            status = self._last
+        if status is not None:
+            self._out.send_status(chat_id, status)
 
     def _unsubscribe(self, chat_id: int) -> None:
         if self._subscribers.remove(chat_id):
             print(f"telegram chat {chat_id} unsubscribed")
-            self._reply(chat_id, "Unsubscribed.")
+            self._out.reply(chat_id, "Unsubscribed.")
         else:
-            self._reply(chat_id, "Not subscribed.")
+            self._out.reply(chat_id, "Not subscribed.")
 
     def _request_check(self, chat_id: int) -> None:
         if not self._subscribers.contains(chat_id):
-            self._reply(chat_id, "Not subscribed.")
+            self._out.reply(chat_id, "Not subscribed.")
             return
         if self._on_check is None:
-            self._reply(chat_id, "Manual check is unavailable.")
+            self._out.reply(chat_id, "Manual check is unavailable.")
             return
         if not self._checks.request(chat_id):
-            self._reply(chat_id, "A pricing check is already running.")
+            self._out.reply(chat_id, "A pricing check is already running.")
             return
-        self._reply(chat_id, "Checking the market…")
+        self._out.reply(chat_id, "Checking the market…")
         self._on_check()
 
-    def _remember(self, chat_id: int, message_id: int, text: str) -> None:
-        self._sent[(chat_id, message_id)] = text
-        if len(self._sent) > 40:
-            del self._sent[next(iter(self._sent))]
+    def _resend(self, chat_id: int) -> None:
+        if not self._subscribers.contains(chat_id):
+            self._out.reply(chat_id, "Not subscribed.")
+            return
+        with self._status_lock:
+            status = self._last
+        if status is None:
+            self._out.reply(chat_id, "No status yet. Send /check to run a pricing check.")
+            return
+        self._out.send_status(chat_id, status)
 
     def _on_callback(self, query: dict[str, Any]) -> None:
         query_id = query.get("id")
@@ -188,100 +216,58 @@ class PriceBot:
         if not isinstance(query_id, str):
             return
         if not isinstance(message, dict):
-            self._answer(query_id, "Not allowed.", alert=True)
+            self._out.answer(query_id, "Not allowed.", alert=True)
             return
         chat = message.get("chat")
         chat_id = chat.get("id") if isinstance(chat, dict) else None
         user = query.get("from")
         user_id = user.get("id") if isinstance(user, dict) else None
-        if not isinstance(chat, dict) or chat.get("type") != "private":
-            self._answer(query_id, "Not allowed.", alert=True)
-            return
-        if not _is_chat_id(chat_id):
-            self._answer(query_id, "Not allowed.", alert=True)
-            return
-        if user_id != chat_id or not self._subscribers.contains(chat_id):
-            self._answer(query_id, "Not allowed.", alert=True)
-            return
         raw = query.get("data")
-        cents = parse_cents(raw) if isinstance(raw, str) else None
-        if cents is None:
-            self._answer(query_id, "Not allowed.", alert=True)
+        action = parse_action(raw) if isinstance(raw, str) else None
+        if (
+            not isinstance(chat, dict)
+            or chat.get("type") != "private"
+            or not _is_chat_id(chat_id)
+            or user_id != chat_id
+            or not self._subscribers.contains(chat_id)
+            or action is None
+            or not isinstance(raw, str)
+        ):
+            self._out.answer(query_id, "Not allowed.", alert=True)
             return
-        price = cents / 100
-        if not _in_bounds(price, self._config):
-            self._answer(query_id, "Price is outside configured bounds.", alert=True)
+        if isinstance(action, Dismiss):
+            self._out.answer(query_id, "Dismissed.", alert=False)
+            self._out.edit(message, chat_id, "✖️ <i>Dismissed.</i>", None)
             return
-        self._answer(query_id, "Updating listing…", alert=False)
+        if expired(action, time.time()):
+            reply = "This report expired. Send /check for a fresh one."
+            self._out.answer(query_id, reply, alert=True)
+            self._out.edit(message, chat_id, "⌛ <i>Expired.</i>", None)
+            return
+        if not in_bounds(action, self._config):
+            self._out.answer(query_id, "Price is outside configured bounds.", alert=True)
+            return
+        self._out.answer(query_id, "Updating listing…", alert=False)
         try:
-            self._vast.update_listing(self._config, price)
+            self._apply(action)
         except Exception as error:
             print(f"telegram listing update failed: {redact(str(error), self._config)}")
-            self._reply(chat_id, "Listing update failed.")
+            self._out.reply(chat_id, "Listing update failed.")
             return
-        self._mark_applied(message, chat_id, price)
+        markup = message.get("reply_markup")
+        keyboard = markup if isinstance(markup, dict) else applied_keyboard(action, raw)
+        self._out.edit(message, chat_id, f"✅ <b>{applied_note(action)}</b>", keyboard)
 
-    def _mark_applied(self, message: dict[str, Any], chat_id: int, price: float) -> None:
-        original = message.get("text")
-        message_id = message.get("message_id")
-        if (
-            not isinstance(original, str)
-            or original.endswith("Applied.")
-            or not isinstance(message_id, int)
-            or isinstance(message_id, bool)
-        ):
-            return
-        stored = self._sent.get((chat_id, message_id))
-        text = f"{stored if stored is not None else escape_html(original)}\n✅ <b>Applied.</b>"
-        try:
-            self._api.call(
-                "editMessageText",
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=keyboard(price),
-            )
-        except TelegramError as error:
-            print(f"telegram edit failed for chat {chat_id}: {redact(str(error), self._config)}")
-            return
-        self._remember(chat_id, message_id, text)
-
-    def _send_status(self, chat_id: int, status: CycleStatus) -> None:
-        offer = apply_keyboard(status, self._config)
-        text = status_text(status, offer_button=offer is not None)
-        params: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        if offer is not None:
-            params["reply_markup"] = offer
-        try:
-            sent = self._api.call("sendMessage", **params)
-        except TelegramError as error:
-            if error.code == 403:
-                self._subscribers.remove(chat_id)
-                print(f"telegram chat {chat_id} blocked the bot; unsubscribed")
-                return
-            print(f"telegram send failed for chat {chat_id}: {redact(str(error), self._config)}")
-            return
-        message_id = sent.get("message_id") if isinstance(sent, dict) else None
-        if isinstance(message_id, int) and not isinstance(message_id, bool):
-            self._remember(chat_id, message_id, text)
-
-    def _reply(self, chat_id: int, text: str) -> None:
-        try:
-            self._api.call("sendMessage", chat_id=chat_id, text=text)
-        except TelegramError as error:
-            print(f"telegram send failed for chat {chat_id}: {redact(str(error), self._config)}")
-
-    def _answer(self, query_id: str, text: str, *, alert: bool) -> None:
-        try:
-            self._api.call(
-                "answerCallbackQuery",
-                callback_query_id=query_id,
-                text=text,
-                show_alert=alert,
-            )
-        except TelegramError as error:
-            print(f"telegram callback answer failed: {redact(str(error), self._config)}")
+    def _apply(self, action: SetGpu | SetRates) -> None:
+        """Write the tapped value and keep the rest of the live listing."""
+        own = self._vast.own_machine(self._config)
+        gpu = required_number(own, "listed_gpu_cost")
+        rates = listed_rates(own)
+        if isinstance(action, SetGpu):
+            gpu = action.price
+        else:
+            rates = action.rates
+        self._vast.update_listing(self._config, gpu, rates)
 
 
 def _is_chat_id(value: object) -> TypeGuard[int]:
@@ -294,7 +280,3 @@ def _command(text: str) -> tuple[str, str] | None:
     head, _, rest = text.partition(" ")
     name, _, _bot = head.partition("@")
     return name.lower(), rest.strip()
-
-
-def _in_bounds(price: float, config: Config) -> bool:
-    return config.min_price <= price <= config.max_price and price >= config.min_bid_price

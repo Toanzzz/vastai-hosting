@@ -8,6 +8,8 @@ Row = dict[str, Any]
 
 # Below this, the listed price and the public offer disagree (e.g. a price change mid-cycle).
 MIN_HOST_SHARE = 0.5
+# Vast lists bandwidth in $/GB; the service works in $/TB.
+GB_PER_TB = 1024
 
 
 def required_number(row: Row, field: str) -> float:
@@ -34,11 +36,27 @@ def _optional_number(row: Row, key: str) -> float | None:
     return None
 
 
+def _scaled(row: Row, key: str, factor: float) -> float | None:
+    value = _optional_number(row, key)
+    return None if value is None else round(value * factor, 4)
+
+
+def gpu_in_bounds(price: float, config: Config) -> bool:
+    return (
+        isfinite(price)
+        and config.min_price <= price <= config.max_price
+        and price >= config.min_bid_price
+    )
+
+
 def host_details(own: Row) -> Row:
     return {
         "gpuName": own.get("gpu_name"),
         "gpuCount": own.get("num_gpus"),
         "currentGpuPrice": required_number(own, "listed_gpu_cost"),
+        "currentDiskPrice": _scaled(own, "listed_storage_cost", 1),
+        "currentUploadPricePerTb": _scaled(own, "listed_inet_up_cost", GB_PER_TB),
+        "currentDownloadPricePerTb": _scaled(own, "listed_inet_down_cost", GB_PER_TB),
         "reliability": _optional_number(own, "reliability2"),
         "gpuRamMb": _optional_number(own, "gpu_ram"),
         "cpuRamMb": _optional_number(own, "cpu_ram"),
@@ -120,6 +138,9 @@ def peers_from_search(batches: list[Any], own: Row, config: Config, share: float
         peers.append(
             {
                 "gpuPrice": round(float(base) / count * share, 4),
+                "diskPrice": _scaled(item, "storage_cost", share),
+                "uploadPricePerTb": _scaled(item, "inet_up_cost", share * GB_PER_TB),
+                "downloadPricePerTb": _scaled(item, "inet_down_cost", share * GB_PER_TB),
                 "reliability": _optional_number(item, "reliability2"),
                 "gpuRamMb": _optional_number(item, "gpu_ram"),
                 "cpuRamMb": _optional_number(item, "cpu_ram"),
@@ -165,10 +186,7 @@ def _differs(row: Row, key: str, value: float) -> bool:
 
 def listing_changed(own: Row, config: Config, now_seconds: float) -> bool:
     return (
-        _differs(own, "listed_storage_cost", config.disk_price)
-        or _differs(own, "listed_inet_up_cost", config.upload_price)
-        or _differs(own, "listed_inet_down_cost", config.download_price)
-        or _differs(own, "min_bid_price", config.min_bid_price)
+        _differs(own, "min_bid_price", config.min_bid_price)
         or _differs(own, "credit_discount_max", config.discount_rate)
         or _differs(own, "listed_volume_cost", config.volume_price)
         or own.get("listed_min_gpu_count") != config.min_chunk
@@ -180,8 +198,6 @@ def listing_changed(own: Row, config: Config, now_seconds: float) -> bool:
 
 
 def price_changed(current: float, target: float, config: Config) -> bool:
-    return (
-        abs(target - current) + 0.000001 >= config.min_change
-        or not config.min_price <= current <= config.max_price
-        or current < config.min_bid_price
+    return abs(target - current) + 0.000001 >= config.min_change or not gpu_in_bounds(
+        current, config
     )

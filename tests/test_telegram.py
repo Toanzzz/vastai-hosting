@@ -1,4 +1,5 @@
 import io
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -9,11 +10,12 @@ from typing import Any
 
 import pytest
 
+from vastai_hosting.buttons import BUTTON_TTL_SECONDS, Dismiss, SetGpu, SetRates, parse_action
 from vastai_hosting.config import Config
+from vastai_hosting.rates import PeerRates, Rates
 from vastai_hosting.status import (
     CycleStatus,
     PriceChoice,
-    parse_cents,
     status_text,
     suggestion_choices,
 )
@@ -23,6 +25,14 @@ from vastai_hosting.telegram_api import TelegramApi, TelegramError
 
 TOKEN = "123456:ABC_def"
 SECRET = "join-code"
+NOW = int(time.time())
+LISTED = Rates(0.15, 2.0, 2.0)
+OWN: dict[str, Any] = {
+    "listed_gpu_cost": 0.55,
+    "listed_storage_cost": 0.15,
+    "listed_inet_up_cost": 2 / 1024,
+    "listed_inet_down_cost": 2 / 1024,
+}
 
 
 def config(tmp_path: Path) -> Config:
@@ -33,14 +43,16 @@ def config(tmp_path: Path) -> Config:
         gemini_model="gemini-flash-latest",
         gemini_thinking_budget=1024,
         poll_seconds=1800,
+        sample_seconds=600,
         min_peers=3,
         offer_limit=100,
         min_price=0.35,
         max_price=0.8,
         min_change=0.01,
-        disk_price=0.15,
-        upload_price=0.01,
-        download_price=0.01,
+        min_disk_price=0.05,
+        max_disk_price=0.4,
+        min_bandwidth_price=1.0,
+        max_bandwidth_price=10.0,
         min_bid_price=0.3,
         discount_rate=0.1,
         min_chunk=1,
@@ -51,6 +63,7 @@ def config(tmp_path: Path) -> Config:
         telegram_bot_token=TOKEN,
         telegram_subscribe_secret=SECRET,
         telegram_state_path=str(tmp_path / "subscribers.json"),
+        history_state_path=str(tmp_path / "occupancy.json"),
     )
 
 
@@ -58,6 +71,7 @@ def status() -> CycleStatus:
     estimates = ((0.55, 0.9), (0.72, 0.8), (0.8, 0.4))
     return CycleStatus(
         machine_id=42,
+        at=NOW,
         current=0.55,
         suggested=0.72,
         occupancy=0.8,
@@ -83,18 +97,25 @@ def status() -> CycleStatus:
         median=0.5,
         rationale="Peers are cheaper",
         listing_settings_differ=True,
+        listed_rates=LISTED,
+        suggested_rates=Rates(0.15, 4.0, 4.0),
+        peer_rates=PeerRates(0.15, 3.9, None),
+        rates_rationale="Peers charge more for bandwidth",
     )
 
 
 class Listing:
     def __init__(self, error: Exception | None = None) -> None:
-        self.prices: list[float] = []
+        self.writes: list[tuple[float, Rates]] = []
         self.error = error
 
-    def update_listing(self, config: Config, target: float) -> None:
+    def own_machine(self, config: Config) -> dict[str, Any]:
+        return OWN
+
+    def update_listing(self, config: Config, gpu: float, rates: Rates) -> None:
         if self.error is not None:
             raise self.error
-        self.prices.append(target)
+        self.writes.append((gpu, rates))
 
 
 class Transport:
@@ -159,6 +180,10 @@ def texts(transport: Transport) -> list[str]:
     ]
 
 
+def calls(transport: Transport, name: str) -> list[dict[str, Any]]:
+    return [params for method, params in transport.calls if method == name]
+
+
 def test_suggestions_keep_the_best_price_and_two_alternatives() -> None:
     choices = suggestion_choices(
         ((0.45, 0.9), (0.5, 0.8), (0.6, 0.5), (0.7, 0.2)),
@@ -182,8 +207,8 @@ def test_suggestions_keep_the_best_price_and_two_alternatives() -> None:
     assert [choice.price for choice in tied] == [0.5, 0.4, 0.8]
 
 
-def test_status_message_includes_the_price_button() -> None:
-    text = status_text(status(), offer_button=True)
+def test_status_message_shows_prices_market_and_rates(tmp_path: Path) -> None:
+    text = status_text(status(), config(tmp_path))
     assert "🖥 <b>Machine 42</b>" in text
     assert "<b>Listed</b> $0.55/GPU-h" in text
     assert "<b>Suggested</b> $0.72/GPU-h <i>(+$0.17)</i>" in text
@@ -201,8 +226,19 @@ def test_status_message_includes_the_price_button() -> None:
     assert "<b>$0.5760</b>/h · <b>$414.72</b>/mo" in text
     assert "Listing settings differ from config. Applying also refreshes them." in text
     assert "<i>Peers are cheaper</i>" in text
-    assert parse_cents("p:72") == 72
-    assert parse_cents("p:05") is None
+    assert "Storage &amp; bandwidth" in text
+    assert "Upload/TB     $2.00    $4.00  $3.90" in text
+    assert "Download/TB   $2.00    $4.00    n/a" in text
+    assert "<i>Peers charge more for bandwidth</i>" in text
+
+
+def test_callback_data_round_trips() -> None:
+    assert parse_action(f"p:72:{NOW}") == SetGpu(72, NOW)
+    assert parse_action("p:72") == SetGpu(72, None)
+    assert parse_action(f"r:15:400:350:{NOW}") == SetRates(15, 400, 350, NOW)
+    assert parse_action("d") == Dismiss()
+    for bad in ("p:05:1", "p:7²:1", "p:72:", "r:1:2:1", "x:1:2", "p:1:2:3", "p:1234567"):
+        assert parse_action(bad) is None
 
 
 def test_wrong_start_does_not_subscribe(tmp_path: Path) -> None:
@@ -217,7 +253,8 @@ def test_start_subscribes_a_private_chat(tmp_path: Path) -> None:
     bot.handle(message("/start@HostBot join-code"))
     assert subscribers.chats() == (7,)
     assert texts(transport) == [
-        "Subscribed. Status arrives after each pricing cycle. Send /check to run one now."
+        "Subscribed. Status arrives after each pricing cycle. "
+        "Send /check to run one now, or /status for the latest."
     ]
     bot.handle(message("/start join-code"))
     assert texts(transport)[-1] == "Already subscribed."
@@ -245,28 +282,56 @@ def test_new_subscriber_receives_the_latest_status(tmp_path: Path) -> None:
     bot.publish(status())
     assert subscribers.chats() == ()
     bot.handle(message("/start join-code"))
-    sent = [params for method, params in transport.calls if method == "sendMessage"]
-    assert sent[0]["text"] == (
-        "Subscribed. Status arrives after each pricing cycle. Send /check to run one now."
-    )
+    sent = calls(transport, "sendMessage")
     assert "$0.72/GPU-h" in str(sent[1]["text"])
     assert sent[1]["parse_mode"] == "HTML"
-    markup = sent[1]["reply_markup"]
-    assert isinstance(markup, dict)
-    rows = markup["inline_keyboard"]
-    assert [row[0]["callback_data"] for row in rows] == ["p:72", "p:80"]
+    rows = sent[1]["reply_markup"]["inline_keyboard"]
+    assert [row[0]["callback_data"] for row in rows] == [
+        f"p:72:{NOW}",
+        f"p:80:{NOW}",
+        f"r:15:400:400:{NOW}",
+        "d",
+    ]
     assert rows[0][0]["text"] == "Best $0.72 · $414.72/mo"
     assert rows[1][0]["text"] == "Set $0.80 · $230.40/mo"
+    assert rows[2][0]["text"] == "Set disk/bandwidth rates"
+    assert rows[3][0]["text"] == "Dismiss"
+
+
+def test_status_command_resends_the_latest_report(tmp_path: Path) -> None:
+    bot, _listing, transport, subscribers = build(tmp_path)
+    bot.handle(message("/status"))
+    assert texts(transport) == ["Not subscribed."]
+    assert subscribers.add(7)
+    bot.handle(message("/status"))
+    assert texts(transport)[-1] == "No status yet. Send /check to run a pricing check."
+    bot.publish(status())
+    bot.handle(message("/status@HostBot"))
+    sent = calls(transport, "sendMessage")
+    assert len(sent) == 4
+    assert sent[-1]["text"] == sent[-2]["text"]
+    assert "reply_markup" in sent[-1]
 
 
 @pytest.mark.parametrize(
     ("update", "reply", "subscribe"),
     [
-        (callback("p:72"), "Not allowed.", False),
-        (callback("p:72", chat_type="group", chat_id=-5, user_id=-5), "Not allowed.", False),
+        (callback(f"p:72:{NOW}"), "Not allowed.", False),
+        (
+            callback(f"p:72:{NOW}", chat_type="group", chat_id=-5, user_id=-5),
+            "Not allowed.",
+            False,
+        ),
         (callback("p:05"), "Not allowed.", True),
-        (callback("p:900"), "Price is outside configured bounds.", True),
-        (callback("p:72", user_id=8), "Not allowed.", True),
+        (callback(f"p:900:{NOW}"), "Price is outside configured bounds.", True),
+        (callback(f"r:90:400:400:{NOW}"), "Price is outside configured bounds.", True),
+        (callback(f"p:72:{NOW}", user_id=8), "Not allowed.", True),
+        (
+            callback(f"p:72:{NOW - BUTTON_TTL_SECONDS - 60}"),
+            "This report expired. Send /check for a fresh one.",
+            True,
+        ),
+        (callback("p:72"), "This report expired. Send /check for a fresh one.", True),
     ],
 )
 def test_rejected_callbacks_do_not_update_the_listing(
@@ -276,45 +341,81 @@ def test_rejected_callbacks_do_not_update_the_listing(
     if subscribe:
         assert subscribers.add(7)
     bot.handle(update)
-    assert listing.prices == []
-    answers = [params for method, params in transport.calls if method == "answerCallbackQuery"]
+    assert listing.writes == []
+    answers = calls(transport, "answerCallbackQuery")
     assert answers[-1]["text"] == reply
     assert answers[-1]["show_alert"] is True
 
 
-def test_allowed_callback_updates_the_listing(tmp_path: Path) -> None:
+def test_expired_button_is_removed(tmp_path: Path) -> None:
+    bot, _listing, transport, subscribers = build(tmp_path)
+    assert subscribers.add(7)
+    bot.handle(callback("p:72"))
+    edited = calls(transport, "editMessageText")[-1]
+    assert edited["text"] == "Machine 42\n⌛ <i>Expired.</i>"
+    assert "reply_markup" not in edited
+
+
+def test_gpu_tap_keeps_the_listed_rates(tmp_path: Path) -> None:
     order: list[str] = []
 
     class RecordingListing(Listing):
-        def update_listing(self, config: Config, target: float) -> None:
-            order.append(f"update:{target}")
-            self.prices.append(target)
+        def update_listing(self, config: Config, gpu: float, rates: Rates) -> None:
+            order.append(f"update:{gpu}")
+            super().update_listing(config, gpu, rates)
 
     bot, listing, transport, subscribers = build(tmp_path, RecordingListing(), Transport(order))
     assert subscribers.add(7)
-    bot.handle(callback("p:72"))
-    assert listing.prices == [0.72]
+    bot.handle(callback(f"p:72:{NOW}"))
+    assert listing.writes == [(0.72, LISTED)]
     assert order == ["answerCallbackQuery", "update:0.72", "editMessageText"]
     edited = transport.calls[-1][1]
-    assert edited["text"] == "Machine 42\n✅ <b>Applied.</b>"
+    assert edited["text"] == "Machine 42\n✅ <b>Applied $0.72/GPU-h.</b>"
     assert edited["parse_mode"] == "HTML"
     assert edited["reply_markup"]["inline_keyboard"][0][0]["text"] == "Set price to $0.72"
+
+
+def test_rates_tap_keeps_the_listed_gpu_price(tmp_path: Path) -> None:
+    bot, listing, transport, subscribers = build(tmp_path)
+    assert subscribers.add(7)
+    update = callback(f"r:15:400:350:{NOW}")
+    keyboard = {"inline_keyboard": [[{"text": "Dismiss", "callback_data": "d"}]]}
+    update["callback_query"]["message"]["reply_markup"] = keyboard
+    bot.handle(update)
+    assert listing.writes == [(0.55, Rates(0.15, 4.0, 3.5))]
+    edited = calls(transport, "editMessageText")[-1]
+    assert edited["text"] == "Machine 42\n✅ <b>Applied disk/bandwidth rates.</b>"
+    assert edited["reply_markup"] == keyboard
+
+
+def test_dismiss_removes_the_buttons(tmp_path: Path) -> None:
+    bot, listing, transport, subscribers = build(tmp_path)
+    assert subscribers.add(7)
+    bot.publish(status())
+    bot.handle(callback("d", text="Machine 42"))
+    assert listing.writes == []
+    assert calls(transport, "answerCallbackQuery")[-1]["text"] == "Dismissed."
+    edited = calls(transport, "editMessageText")[-1]
+    assert edited["text"] == "Machine 42\n✖️ <i>Dismissed.</i>"
+    assert "reply_markup" not in edited
+    bot.handle(callback("d", user_id=8))
+    assert len(calls(transport, "editMessageText")) == 1
 
 
 def test_second_tap_updates_again(tmp_path: Path) -> None:
     bot, listing, transport, subscribers = build(tmp_path)
     assert subscribers.add(7)
-    bot.handle(callback("p:72", text="Machine 42\nApplied."))
-    assert listing.prices == [0.72]
-    assert [method for method, _params in transport.calls if method == "editMessageText"] == []
+    bot.handle(callback(f"p:72:{NOW}", text="Machine 42\n✅ Applied $0.72/GPU-h."))
+    assert listing.writes == [(0.72, LISTED)]
+    assert calls(transport, "editMessageText") == []
 
 
 def test_failed_listing_update_is_reported(tmp_path: Path) -> None:
     bot, _listing, transport, subscribers = build(tmp_path, Listing(RuntimeError("vast down")))
     assert subscribers.add(7)
-    bot.handle(callback("p:72"))
+    bot.handle(callback(f"p:72:{NOW}"))
     assert texts(transport) == ["Listing update failed."]
-    assert [method for method, _params in transport.calls if method == "editMessageText"] == []
+    assert calls(transport, "editMessageText") == []
 
 
 def test_blocked_chat_is_removed(tmp_path: Path) -> None:
@@ -331,8 +432,18 @@ def test_publish_messages_every_subscriber(tmp_path: Path) -> None:
     assert subscribers.add(3)
     assert subscribers.add(9)
     bot.publish(status())
-    chats = [params["chat_id"] for method, params in transport.calls if method == "sendMessage"]
-    assert chats == [3, 9]
+    assert [params["chat_id"] for params in calls(transport, "sendMessage")] == [3, 9]
+
+
+def test_rental_changes_are_announced(tmp_path: Path) -> None:
+    bot, _listing, transport, subscribers = build(tmp_path)
+    assert subscribers.add(3)
+    bot.notify_rental(True, 0.55, 30.0)
+    bot.notify_rental(False, 0.55, 0.5)
+    assert texts(transport) == [
+        "🟢 Rental started on machine 42 at $0.55/GPU-h, after about 30 h idle.",
+        "⚪ Rental ended on machine 42 after under an hour. Listed at $0.55/GPU-h.",
+    ]
 
 
 def test_http_error_hides_the_bot_token(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -367,23 +478,34 @@ def test_network_error_hides_the_bot_token(monkeypatch: pytest.MonkeyPatch) -> N
 def test_unchanged_price_omits_only_that_button(tmp_path: Path) -> None:
     bot, _listing, transport, subscribers = build(tmp_path)
     assert subscribers.add(7)
-    bot.publish(replace(status(), current=0.72, suggested=0.72))
-    sent = [params for method, params in transport.calls if method == "sendMessage"]
+    bot.publish(replace(status(), current=0.72, suggested=0.72, suggested_rates=LISTED))
+    sent = calls(transport, "sendMessage")
     rows = sent[0]["reply_markup"]["inline_keyboard"]
-    assert [row[0]["callback_data"] for row in rows] == ["p:55", "p:80"]
+    assert [row[0]["callback_data"] for row in rows] == [f"p:55:{NOW}", f"p:80:{NOW}", "d"]
+    assert [row[0]["text"].split()[0] for row in rows] == ["Set", "Set", "Dismiss"]
     assert "matches the listed price" in str(sent[0]["text"])
+    assert "Suggested rates match the listed rates." in str(sent[0]["text"])
 
 
-def test_out_of_bounds_price_omits_the_button(tmp_path: Path) -> None:
+def test_out_of_bounds_suggestions_have_no_buttons(tmp_path: Path) -> None:
     bot, _listing, transport, subscribers = build(tmp_path)
     assert subscribers.add(7)
-    bot.publish(replace(status(), suggested=0.1, choices=(PriceChoice(0.1, None, None),)))
-    sent = [params for method, params in transport.calls if method == "sendMessage"]
+    bot.publish(
+        replace(
+            status(),
+            suggested=0.1,
+            choices=(PriceChoice(0.1, None, None),),
+            suggested_rates=Rates(0.9, 4.0, 4.0),
+        )
+    )
+    sent = calls(transport, "sendMessage")
     assert "reply_markup" not in sent[0]
     assert "cannot be applied" in str(sent[0]["text"])
+    assert "Suggested rates are outside the configured bounds." in str(sent[0]["text"])
 
 
-def test_fallback_and_escaped_rationale_text() -> None:
+def test_fallback_and_escaped_rationale_text(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
     fallback = replace(
         status(),
         rationale=None,
@@ -394,16 +516,16 @@ def test_fallback_and_escaped_rationale_text() -> None:
         current=0.55,
         suggested=0.48,
         median=0.5,
+        rates_rationale=None,
     )
-    text = status_text(fallback, offer_button=True)
+    text = status_text(fallback, cfg)
     assert "Gemini unavailable" in text
     assert "$0.02 under the $0.5000 peer median." in text
+    assert "Peer median rates, rounded to the cent." in text
     assert "Estimates" not in text
-    rounded = status_text(
-        replace(fallback, suggested=0.36, median=0.375, current=0.6), offer_button=True
-    )
+    rounded = status_text(replace(fallback, suggested=0.36, median=0.375, current=0.6), cfg)
     assert "Rounded to the nearest cent." in rounded
-    escaped = status_text(replace(status(), rationale="a < b & c"), offer_button=True)
+    escaped = status_text(replace(status(), rationale="a < b & c"), cfg)
     assert "<i>a &lt; b &amp; c</i>" in escaped
 
 
@@ -419,33 +541,33 @@ def test_applied_edit_keeps_the_formatted_status(tmp_path: Path) -> None:
     bot, _listing, transport, subscribers = build(tmp_path, transport=Ids())
     assert subscribers.add(7)
     bot.publish(status())
-    bot.handle(callback("p:72", text="plain from telegram"))
+    bot.handle(callback(f"p:72:{NOW}", text="plain from telegram"))
     edited = transport.calls[-1][1]
     assert "plain from telegram" not in str(edited["text"])
     assert "<b>Machine 42</b>" in str(edited["text"])
-    assert str(edited["text"]).endswith("\n✅ <b>Applied.</b>")
+    assert str(edited["text"]).endswith("\n✅ <b>Applied $0.72/GPU-h.</b>")
 
 
 def test_check_runs_the_cycle_for_a_subscriber(tmp_path: Path) -> None:
-    calls: list[str] = []
-    bot, _listing, transport, subscribers = build(tmp_path, on_check=lambda: calls.append("go"))
+    checks: list[str] = []
+    bot, _listing, transport, subscribers = build(tmp_path, on_check=lambda: checks.append("go"))
     assert subscribers.add(7)
     bot.handle(message("/check@HostBot"))
-    assert calls == ["go"]
+    assert checks == ["go"]
     assert texts(transport) == ["Checking the market…"]
     bot.handle(message("/check"))
-    assert calls == ["go"]
+    assert checks == ["go"]
     assert texts(transport)[-1] == "A pricing check is already running."
     bot.publish(status())
     bot.handle(message("/check"))
-    assert calls == ["go", "go"]
+    assert checks == ["go", "go"]
 
 
 def test_check_requires_a_subscription(tmp_path: Path) -> None:
-    calls: list[str] = []
-    bot, _listing, transport, _subscribers = build(tmp_path, on_check=lambda: calls.append("go"))
+    checks: list[str] = []
+    bot, _listing, transport, _subscribers = build(tmp_path, on_check=lambda: checks.append("go"))
     bot.handle(message("/check"))
-    assert calls == []
+    assert checks == []
     assert texts(transport) == ["Not subscribed."]
     bot.handle(message("/check", chat_id=-3, chat_type="group"))
     assert transport.calls == [("sendMessage", transport.calls[0][1])]
