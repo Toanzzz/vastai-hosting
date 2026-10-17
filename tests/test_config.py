@@ -50,7 +50,7 @@ def test_load_config_needs_only_api_keys(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.max_price == 1.00
     assert config.min_change == 0.01
     assert config.running_cost == 0.0
-    assert config.sample_seconds == 3600
+    assert config.sample_seconds == 300
     assert config.history_state_path == "data/occupancy.json"
     assert (config.min_disk_price, config.max_disk_price) == (0.05, 0.40)
     assert (config.min_bandwidth_price, config.max_bandwidth_price) == (1.0, 10.0)

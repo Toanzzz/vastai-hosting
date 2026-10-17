@@ -14,7 +14,7 @@ Every other setting uses the default in `src/vastai_hosting/config.py` when the 
 | `GEMINI_THINKING_BUDGET` | `1024` |
 | `MACHINE_ID` | `51673` |
 | `POLL_SECONDS` | `86400` |
-| `SAMPLE_SECONDS` | `3600` |
+| `SAMPLE_SECONDS` | `300` |
 | `TELEGRAM_STATE_PATH` | `data/subscribers.json` |
 | `HISTORY_STATE_PATH` | `data/occupancy.json` |
 | `MIN_PEERS` | `5` |

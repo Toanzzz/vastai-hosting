@@ -45,7 +45,7 @@ DEFAULTS: dict[str, str] = {
     "GEMINI_THINKING_BUDGET": "1024",
     "MACHINE_ID": "51673",
     "POLL_SECONDS": "86400",
-    "SAMPLE_SECONDS": "3600",
+    "SAMPLE_SECONDS": "300",
     "MIN_PEERS": "5",
     "OFFER_LIMIT": "200",
     "MIN_PRICE": "0.40",
